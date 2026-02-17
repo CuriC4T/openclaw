@@ -1,4 +1,8 @@
 import { ChannelType, MessageType, type User } from "@buape/carbon";
+import type {
+  DiscordMessagePreflightContext,
+  DiscordMessagePreflightParams,
+} from "./message-handler.preflight.types.js";
 import { hasControlCommand } from "../../auto-reply/command-detection.js";
 import { shouldHandleTextCommands } from "../../auto-reply/commands-registry.js";
 import {
@@ -44,10 +48,6 @@ import {
   resolveDiscordSystemLocation,
   resolveTimestampMs,
 } from "./format.js";
-import type {
-  DiscordMessagePreflightContext,
-  DiscordMessagePreflightParams,
-} from "./message-handler.preflight.types.js";
 import {
   resolveDiscordChannelInfo,
   resolveDiscordMessageChannelId,
@@ -81,6 +81,39 @@ export async function preflightDiscordMessage(
   }
 
   const allowBots = params.discordConfig?.allowBots ?? false;
+  // --- Multi-bot mention routing (single gateway, multiple discord bots)
+  // If another bot is mentioned but this bot isn't, skip processing for this bot.
+  // If no bot is mentioned, both bots may respond (per desired behavior).
+  const BOT_IDS = new Set([
+    "1470789779414319194",
+    "1471473925098832015",
+  ]);
+  const isGuild = Boolean(params.data.guild_id);
+
+  const myBotId = params.botUserId;
+  if (isGuild && myBotId && BOT_IDS.has(myBotId)) {
+    const text = resolveDiscordMessageText(params.data) ?? "";
+
+    const isMentioned = (id: string) =>
+      text.includes(`<@${id}>`) || text.includes(`<@!${id}>`);
+
+    const hasMyMention = isMentioned(myBotId);
+
+    let hasOtherMention = false;
+    for (const id of BOT_IDS) {
+      if (id !== myBotId && isMentioned(id)) {
+        hasOtherMention = true;
+        break;
+      }
+    }
+
+    if (hasOtherMention && !hasMyMention) {
+      logVerbose(`discord: skip (mentioned other bot) botUserId=${myBotId} msg=${message.id}`);
+      return null;
+    }
+  }
+  // --- end multi-bot mention routing
+
   if (params.botUserId && author.id === params.botUserId) {
     // Always ignore own messages to prevent self-reply loops
     return null;
@@ -143,13 +176,13 @@ export async function preflightDiscordMessage(
       const allowList = normalizeDiscordAllowList(effectiveAllowFrom, ["discord:", "user:", "pk:"]);
       const allowMatch = allowList
         ? resolveDiscordAllowListMatch({
-            allowList,
-            candidate: {
-              id: sender.id,
-              name: sender.name,
-              tag: sender.tag,
-            },
-          })
+          allowList,
+          candidate: {
+            id: sender.id,
+            name: sender.name,
+            tag: sender.tag,
+          },
+        })
         : { allowed: false };
       const allowMatchMeta = formatAllowlistMatchMeta(allowMatch);
       const permitted = allowMatch.allowed;
@@ -275,9 +308,9 @@ export async function preflightDiscordMessage(
 
   const guildInfo = isGuildMessage
     ? resolveDiscordGuildEntry({
-        guild: params.data.guild ?? undefined,
-        guildEntries: params.guildEntries,
-      })
+      guild: params.data.guild ?? undefined,
+      guildEntries: params.guildEntries,
+    })
     : null;
   logDebug(
     `[discord-preflight] guild_id=${params.data.guild_id} guild_obj=${!!params.data.guild} guild_obj_id=${params.data.guild?.id} guildInfo=${!!guildInfo} guildEntries=${params.guildEntries ? Object.keys(params.guildEntries).join(",") : "none"}`,
@@ -317,15 +350,15 @@ export async function preflightDiscordMessage(
   const baseSessionKey = route.sessionKey;
   const channelConfig = isGuildMessage
     ? resolveDiscordChannelConfigWithFallback({
-        guildInfo,
-        channelId: messageChannelId,
-        channelName,
-        channelSlug: threadChannelSlug,
-        parentId: threadParentId ?? undefined,
-        parentName: threadParentName ?? undefined,
-        parentSlug: threadParentSlug,
-        scope: threadChannel ? "thread" : "channel",
-      })
+      guildInfo,
+      channelId: messageChannelId,
+      channelName,
+      channelSlug: threadChannelSlug,
+      parentId: threadParentId ?? undefined,
+      parentName: threadParentName ?? undefined,
+      parentSlug: threadParentSlug,
+      scope: threadChannel ? "thread" : "channel",
+    })
     : null;
   const channelMatchMeta = formatAllowlistMatchMeta(channelConfig);
   if (shouldLogVerbose()) {
@@ -400,11 +433,11 @@ export async function preflightDiscordMessage(
   const historyEntry =
     isGuildMessage && params.historyLimit > 0 && textForHistory
       ? ({
-          sender: sender.label,
-          body: textForHistory,
-          timestamp: resolveTimestampMs(message.timestamp),
-          messageId: message.id,
-        } satisfies HistoryEntry)
+        sender: sender.label,
+        body: textForHistory,
+        timestamp: resolveTimestampMs(message.timestamp),
+        messageId: message.id,
+      } satisfies HistoryEntry)
       : undefined;
 
   const threadOwnerId = threadChannel ? (threadChannel.ownerId ?? channelInfo?.ownerId) : undefined;
@@ -504,10 +537,10 @@ export async function preflightDiscordMessage(
     ]);
     const ownerOk = ownerAllowList
       ? allowListMatches(ownerAllowList, {
-          id: sender.id,
-          name: sender.name,
-          tag: sender.tag,
-        })
+        id: sender.id,
+        name: sender.name,
+        tag: sender.tag,
+      })
       : false;
     const useAccessGroups = params.cfg.commands?.useAccessGroups !== false;
     const commandGate = resolveControlCommandGate({
