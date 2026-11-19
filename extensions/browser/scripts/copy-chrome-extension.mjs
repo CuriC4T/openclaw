@@ -37,10 +37,12 @@ async function main() {
   }
   await fs.rm(outDir, { recursive: true, force: true });
   await fs.mkdir(path.dirname(outDir), { recursive: true });
-  // Ship only the runtime extension; colocated *.test.ts and *.d.ts stay out.
+  // Ship only the runtime extension: Chrome loads plain JavaScript, so every
+  // colocated TypeScript file (tests, helpers, declarations) stays out.
   await fs.cp(srcDir, outDir, {
     recursive: true,
-    filter: (source) => !source.endsWith(".test.ts") && !source.endsWith(".d.ts"),
+    filter: (source) =>
+      !/(?:sidepanel|copilot|page-share)/iu.test(path.basename(source)) && !source.endsWith(".ts"),
   });
 }
 

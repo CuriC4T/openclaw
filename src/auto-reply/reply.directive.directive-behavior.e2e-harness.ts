@@ -1,4 +1,4 @@
-/** E2E harness for reply directive behavior tests. */
+/** Lifecycle setup for direct directive-handler tests. */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { afterEach, beforeEach, vi } from "vitest";
 import { clearRuntimeAuthProfileStoreSnapshots } from "../agents/auth-profiles.js";
@@ -8,16 +8,14 @@ import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import type { PluginRegistry } from "../plugins/registry.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import type { ProviderPlugin } from "../plugins/types.js";
-import { resetSkillsRefreshForTest } from "../skills/runtime/refresh.test-support.js";
+import { closeSkillsWatchers } from "../skills/runtime/refresh.js";
 import {
   clearSessionAuthProfileOverrideMock,
   compactEmbeddedAgentSessionMock,
   loadModelCatalogMock,
   resolveCommandSecretRefsViaGatewayMock,
-  resolveSessionAuthProfileOverrideMock,
-  runDirectiveBehaviorReplyAgent,
+  resolveSessionAuthSelectionMock,
   runEmbeddedAgentMock,
-  runDirectiveBehaviorPreparedReply,
   runPreparedReplyMock,
   runReplyAgentMock,
 } from "./reply.directive.directive-behavior.e2e-mocks.js";
@@ -103,7 +101,7 @@ function createDirectiveBehaviorProviderRegistry(): ReturnType<typeof createEmpt
 
 export function installDirectiveBehaviorE2EHooks() {
   beforeEach(async () => {
-    await resetSkillsRefreshForTest();
+    await closeSkillsWatchers(true);
     clearRuntimeAuthProfileStoreSnapshots();
     clearSessionStoreCacheForTest();
     resetSystemEventsForTest();
@@ -123,16 +121,14 @@ export function installDirectiveBehaviorE2EHooks() {
     }));
     clearSessionAuthProfileOverrideMock.mockReset();
     clearSessionAuthProfileOverrideMock.mockResolvedValue(undefined);
-    resolveSessionAuthProfileOverrideMock.mockReset();
-    resolveSessionAuthProfileOverrideMock.mockResolvedValue(undefined);
+    resolveSessionAuthSelectionMock.mockReset();
+    resolveSessionAuthSelectionMock.mockResolvedValue(undefined);
     runReplyAgentMock.mockReset();
-    runReplyAgentMock.mockImplementation(runDirectiveBehaviorReplyAgent);
     runPreparedReplyMock.mockReset();
-    runPreparedReplyMock.mockImplementation(runDirectiveBehaviorPreparedReply);
   });
 
   afterEach(async () => {
-    await resetSkillsRefreshForTest();
+    await closeSkillsWatchers(true);
     clearRuntimeAuthProfileStoreSnapshots();
     clearSessionStoreCacheForTest();
     resetSystemEventsForTest();

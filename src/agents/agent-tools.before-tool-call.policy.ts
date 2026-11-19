@@ -1,11 +1,13 @@
 /**
  * Ordered before_tool_call policy chain.
  *
- * Ordering is behavior: loop admission, owner probes, voice confirmation,
+ * Ordering is behavior: loop admission, owner probes,
  * trusted policies, approvals, normal hooks, and final owner approval must
  * remain in this sequence.
  */
+import { isDeepStrictEqual } from "node:util";
 import { freezeDiagnosticTraceContext } from "../infra/diagnostic-trace-context.js";
+import { cloneHookIsolationValue } from "../plugins/hook-isolation.js";
 import { getGlobalHookRunnerRegistry } from "../plugins/hook-runner-global-state.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { deriveToolParams } from "../plugins/host-tool-param-parsers.js";
@@ -19,26 +21,14 @@ import type {
   PluginHookToolInputKind,
   PluginHookToolKind,
 } from "../plugins/types.js";
-import { resolveSkillWorkshopToolApproval } from "../skills/workshop/policy.js";
-import {
-  checkClientVoiceToolConfirmationPolicy,
-  consumeClientVoiceToolConfirmationPolicy,
-} from "../talk/client-voice-confirmation.js";
-import {
-  isClientVoiceSessionConfirmable,
-  resolveClientVoiceRunBinding,
-} from "../talk/client-voice-session.js";
 import { isPlainObject } from "../utils.js";
 import {
   mergeParamsWithApprovalOverrides,
   resolveBeforeToolCallApprovalOutcome,
-  resolveSkillWorkshopApprovalForFinalParams,
 } from "./agent-tools.before-tool-call.approval.js";
 import {
   beforeToolCallLog as log,
-  loadBeforeToolCallRuntime,
   resolveToolErrorDiagnostic,
-  shouldEmitLoopWarning,
   unwrapErrorCause,
 } from "./agent-tools.before-tool-call.diagnostics.js";
 import type {
@@ -48,12 +38,21 @@ import type {
 } from "./agent-tools.before-tool-call.types.js";
 import {
   getCodeModeExecBeforeHookMetadataForToolKind,
-  normalizeCodeModeExecBeforeHookParamsForToolKind,
+  reconcileCodeModeExecBeforeHookParams,
 } from "./code-mode-control-tools.js";
-import { normalizeToolName } from "./tool-policy.js";
+import { normalizeToolPolicyName } from "./tool-policy.js";
+import { getGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 const BEFORE_TOOL_CALL_HOOK_FAILURE_REASON =
   "Tool call blocked because before_tool_call hook failed";
+
+/** Keep receipt routing private without widening observable hook outcomes. */
+function markPrivateDecision(
+  outcome: HookOutcome,
+  marker: "genericDecision" | "ownerDecision",
+): void {
+  Object.defineProperty(outcome, marker, { value: true });
+}
 
 export function getBeforeToolCallPolicyDiagnosticState(): BeforeToolCallPolicyDiagnosticState {
   const policyRegistry = getGlobalHookRunnerRegistry() ?? undefined;
@@ -63,27 +62,11 @@ export function getBeforeToolCallPolicyDiagnosticState(): BeforeToolCallPolicyDi
   };
 }
 
-/** Return true when any before_tool_call policy could affect tool execution. */
 export function hasBeforeToolCallPolicy(): boolean {
-  const state = getBeforeToolCallPolicyDiagnosticState();
-  return state.hasBeforeToolCallHook || state.trustedToolPolicies.length > 0;
-}
-
-/** Consume voice approval only after tool-owned finalization produces execution params. */
-export function consumeFinalClientVoiceToolConfirmation(args: {
-  toolName: string;
-  params: unknown;
-  ctx?: HookContext;
-}) {
-  const voiceRun = resolveClientVoiceRunBinding(args.ctx?.runId);
-  return consumeClientVoiceToolConfirmationPolicy({
-    agentId: voiceRun?.agentId,
-    voiceSessionId: voiceRun?.voiceSessionId,
-    runId: args.ctx?.runId,
-    toolName: normalizeToolName(args.toolName || "tool"),
-    toolParams: args.params,
-    ...(voiceRun ? { isConfirmable: () => isClientVoiceSessionConfirmable(voiceRun) } : {}),
-  });
+  return (
+    getGlobalHookRunner()?.hasHooks("before_tool_call") === true ||
+    hasTrustedToolPolicies(getGlobalHookRunnerRegistry() ?? undefined)
+  );
 }
 
 export async function runBeforeToolCallHook(args: {
@@ -96,136 +79,19 @@ export async function runBeforeToolCallHook(args: {
   signal?: AbortSignal;
   approvalMode?: "request" | "report" | "deny" | "defer";
 }): Promise<HookOutcome> {
-  const toolName = normalizeToolName(args.toolName || "tool");
+  const toolName = normalizeToolPolicyName(args.toolName || "tool");
   const params = args.params;
-  let releaseArgumentChurnPolicyWait: (() => void) | undefined;
-
+  if (args.ctx?.awaitSessionDiffBaseline) {
+    await args.ctx.awaitSessionDiffBaseline();
+    args.signal?.throwIfAborted();
+  }
   try {
-    if (args.ctx?.sessionKey) {
-      const {
-        markDiagnosticArgumentChurnObservation,
-        getDiagnosticSessionState,
-        logToolLoopAction,
-        detectToolCallLoop,
-        recordToolCall,
-      } = await loadBeforeToolCallRuntime();
-      const sessionState = getDiagnosticSessionState({
-        sessionKey: args.ctx.sessionKey,
-        sessionId: args.ctx.sessionId,
-      });
-
-      const loopScope = args.ctx.runId ? { runId: args.ctx.runId } : undefined;
-      const loopResult = detectToolCallLoop(
-        sessionState,
-        toolName,
-        params,
-        args.ctx.loopDetection,
-        loopScope,
-      );
-
-      if (args.ctx.loopDetection?.enabled === true) {
-        // Each concurrent policy/approval wait owns a token. Releasing one call
-        // must not expose the churn clock while a sibling is still pending.
-        const policyWaitToken = Symbol("before-tool-call-policy-wait");
-        const policyWaitRef = {
-          sessionKey: args.ctx.sessionKey,
-          sessionId: args.ctx.sessionId,
-          runId: args.ctx.runId,
-          policyWaitToken,
-        };
-        markDiagnosticArgumentChurnObservation({
-          ...policyWaitRef,
-          policyWait: "enter",
-        });
-        releaseArgumentChurnPolicyWait = () =>
-          markDiagnosticArgumentChurnObservation({
-            ...policyWaitRef,
-            policyWait: "exit",
-          });
-      }
-
-      if (loopResult.stuck) {
-        if (loopResult.level === "critical") {
-          log.error(`Blocking ${toolName} due to critical loop: ${loopResult.message}`);
-          logToolLoopAction({
-            sessionKey: args.ctx.sessionKey,
-            sessionId: args.ctx.sessionId,
-            toolName,
-            level: "critical",
-            action: "block",
-            detector: loopResult.detector,
-            count: loopResult.count,
-            message: loopResult.message,
-            pairedToolName: loopResult.pairedToolName,
-          });
-          return {
-            blocked: true,
-            kind: "veto",
-            deniedReason: "tool-loop",
-            reason: loopResult.message,
-            params,
-          };
-        }
-        const baseWarningKey = loopResult.warningKey ?? `${loopResult.detector}:${toolName}`;
-        const warningKey = args.ctx.runId ? `${args.ctx.runId}:${baseWarningKey}` : baseWarningKey;
-        if (shouldEmitLoopWarning(sessionState, warningKey, loopResult.count)) {
-          log.warn(`Loop warning for ${toolName}: ${loopResult.message}`);
-          logToolLoopAction({
-            sessionKey: args.ctx.sessionKey,
-            sessionId: args.ctx.sessionId,
-            toolName,
-            level: "warning",
-            action: "warn",
-            detector: loopResult.detector,
-            count: loopResult.count,
-            message: loopResult.message,
-            pairedToolName: loopResult.pairedToolName,
-          });
-        }
-      }
-
-      if (args.ctx.loopDetection?.enabled === true) {
-        recordToolCall(
-          sessionState,
-          toolName,
-          params,
-          args.toolCallId,
-          args.ctx.loopDetection,
-          loopScope,
-        );
-      }
-    }
-
     const hookRunner = getGlobalHookRunner();
     const hasBeforeToolCallHooks = hookRunner?.hasHooks("before_tool_call") === true;
     const policyRegistry = getGlobalHookRunnerRegistry() ?? undefined;
     const shouldRunTrustedPolicies = hasTrustedToolPolicies(policyRegistry);
     const normalizedParams = isPlainObject(params) ? params : {};
-    const initialCorePolicyResult = await resolveSkillWorkshopToolApproval({
-      toolName,
-      toolParams: normalizedParams,
-      ...(args.ctx?.config ? { config: args.ctx.config } : {}),
-      ...(args.ctx?.workspaceDir ? { workspaceDir: args.ctx.workspaceDir } : {}),
-    });
-    const voiceRun = resolveClientVoiceRunBinding(args.ctx?.runId);
-    const voiceConfirmation = checkClientVoiceToolConfirmationPolicy({
-      agentId: voiceRun?.agentId,
-      voiceSessionId: voiceRun?.voiceSessionId,
-      runId: args.ctx?.runId,
-      toolName,
-      toolParams: normalizedParams,
-      ...(voiceRun ? { isConfirmable: () => isClientVoiceSessionConfirmable(voiceRun) } : {}),
-    });
-    if (!voiceConfirmation.allowed) {
-      return {
-        blocked: true,
-        kind: "veto",
-        deniedReason: "client-voice-confirmation",
-        reason: voiceConfirmation.reason,
-        params,
-      };
-    }
-    if (!initialCorePolicyResult && !shouldRunTrustedPolicies && !hasBeforeToolCallHooks) {
+    if (!shouldRunTrustedPolicies && !hasBeforeToolCallHooks) {
       return { blocked: false, params };
     }
     const deriveOptions =
@@ -233,11 +99,12 @@ export async function runBeforeToolCallHook(args: {
         ? {
             ...(args.ctx.cwd ? { cwd: args.ctx.cwd } : {}),
             ...(args.ctx.sandbox ? { sandbox: args.ctx.sandbox } : {}),
+            ...(args.signal ? { signal: args.signal } : {}),
           }
         : undefined;
-    const derivedToolParams = deriveToolParams(toolName, normalizedParams, deriveOptions);
-    const deriveToolEventParams = (candidateParams: Record<string, unknown>) => {
-      const derived = deriveToolParams(toolName, candidateParams, deriveOptions);
+    const derivedToolParams = await deriveToolParams(toolName, normalizedParams, deriveOptions);
+    const deriveToolEventParams = async (candidateParams: Record<string, unknown>) => {
+      const derived = await deriveToolParams(toolName, candidateParams, deriveOptions);
       return derived.derivedPaths ? { derivedPaths: derived.derivedPaths } : {};
     };
     const toolIdentity = {
@@ -256,8 +123,12 @@ export async function runBeforeToolCallHook(args: {
       ...(args.toolCallId && { toolCallId: args.toolCallId }),
       ...(args.ctx?.channelId && { channelId: args.ctx.channelId }),
       ...(args.ctx?.requester ? { requester: args.ctx.requester } : {}),
+      ...(args.ctx?.trigger && { trigger: args.ctx.trigger }),
     });
     const toolContext = buildToolContext(toolIdentity);
+    // Policies form a mutation chain. Reconcile each decision against the prior
+    // alias pair so an explicit blank rewrite remains fail-closed.
+    let trustedPolicyParams = normalizedParams;
     const trustedPolicyResult = shouldRunTrustedPolicies
       ? await runTrustedToolPolicies(
           {
@@ -276,13 +147,16 @@ export async function runBeforeToolCallHook(args: {
             ...(args.ctx?.config ? { config: args.ctx.config } : {}),
             deriveEvent: deriveToolEventParams,
             normalizeEvent(eventValue) {
-              const normalizedEventParams = normalizeCodeModeExecBeforeHookParamsForToolKind({
-                toolKind: eventValue.toolKind,
-                params: eventValue.params,
+              const normalizedEventParams = reconcileCodeModeExecBeforeHookParams({
+                owner: { toolKind: eventValue.toolKind },
+                originalParams: trustedPolicyParams,
+                hookParams: trustedPolicyParams,
+                adjustedParams: eventValue.params,
               });
               if (!isPlainObject(normalizedEventParams)) {
                 return undefined;
               }
+              trustedPolicyParams = normalizedEventParams;
               const normalizedEventIdentity = getCodeModeExecBeforeHookMetadataForToolKind({
                 toolKind: eventValue.toolKind,
                 params: normalizedEventParams,
@@ -298,16 +172,19 @@ export async function runBeforeToolCallHook(args: {
         )
       : undefined;
     if (trustedPolicyResult?.block) {
-      return {
+      const outcome: HookOutcome = {
         blocked: true,
         kind: "veto",
         deniedReason: "plugin-before-tool-call",
         reason: trustedPolicyResult.blockReason || "Tool call blocked by trusted plugin policy",
         params,
       };
+      markPrivateDecision(outcome, "genericDecision");
+      return outcome;
     }
     let trustedApprovalParams: unknown;
     let trustedApprovalResolution: PluginApprovalResolution | undefined;
+    let trustedApprovalGranted = false;
     if (trustedPolicyResult?.requireApproval) {
       const approvalOutcome = await resolveBeforeToolCallApprovalOutcome({
         result: trustedPolicyResult,
@@ -327,13 +204,11 @@ export async function runBeforeToolCallHook(args: {
         }
         trustedApprovalParams = approvalOutcome.params;
         trustedApprovalResolution = approvalOutcome.approvalResolution;
+        trustedApprovalGranted = true;
       }
     }
-    const rawPolicyAdjustedParams = trustedApprovalParams ?? trustedPolicyResult?.params ?? params;
-    const policyAdjustedParams = normalizeCodeModeExecBeforeHookParamsForToolKind({
-      toolKind: args.toolKind,
-      params: rawPolicyAdjustedParams,
-    });
+    const policyAdjustedParams = trustedApprovalParams ?? trustedPolicyResult?.params ?? params;
+    const trustedApprovalBoundary = trustedApprovalGranted;
     const policyAdjustedToolIdentity =
       getCodeModeExecBeforeHookMetadataForToolKind({
         toolKind: args.toolKind,
@@ -342,96 +217,121 @@ export async function runBeforeToolCallHook(args: {
     const policyAdjustedToolContext = buildToolContext(policyAdjustedToolIdentity);
     const policyAdjustedDerivedToolParams =
       trustedPolicyResult?.params && isPlainObject(policyAdjustedParams)
-        ? deriveToolParams(toolName, policyAdjustedParams, deriveOptions)
+        ? await deriveToolParams(toolName, policyAdjustedParams, deriveOptions)
         : derivedToolParams;
-    if (!hasBeforeToolCallHooks) {
-      const finalApprovalOutcome = await resolveSkillWorkshopApprovalForFinalParams({
-        toolName,
-        params: policyAdjustedParams,
-        approvalMode: args.approvalMode,
-        ...(args.toolCallId ? { toolCallId: args.toolCallId } : {}),
-        ...(args.ctx ? { ctx: args.ctx } : {}),
-        signal: args.signal,
-      });
-      if (finalApprovalOutcome) {
-        return finalApprovalOutcome;
-      }
-      const allowed: HookOutcome = {
-        blocked: false as const,
-        params: policyAdjustedParams,
-      };
-      if (trustedApprovalResolution) {
-        allowed.approvalResolution = trustedApprovalResolution;
-      }
-      return allowed;
-    }
-    const hookEventParams = isPlainObject(policyAdjustedParams) ? policyAdjustedParams : {};
-    const hookResult = await hookRunner.runBeforeToolCall(
-      {
-        toolName,
-        params: hookEventParams,
-        ...policyAdjustedToolIdentity,
-        ...(args.ctx?.runId && { runId: args.ctx.runId }),
-        ...(args.toolCallId && { toolCallId: args.toolCallId }),
-        ...(policyAdjustedDerivedToolParams.derivedPaths
-          ? { derivedPaths: policyAdjustedDerivedToolParams.derivedPaths }
-          : {}),
-      },
-      policyAdjustedToolContext,
-    );
-
-    if (hookResult?.block) {
-      return {
-        blocked: true,
-        kind: "veto",
-        deniedReason: "plugin-before-tool-call",
-        reason: hookResult.blockReason || "Tool call blocked by plugin hook",
-        params: policyAdjustedParams,
-      };
-    }
-
-    let finalParams = policyAdjustedParams;
+    const approvedParamsSnapshot =
+      trustedApprovalBoundary && hasBeforeToolCallHooks
+        ? cloneHookIsolationValue("before_tool_call", policyAdjustedParams)
+        : undefined;
+    let finalParams = approvedParamsSnapshot ?? policyAdjustedParams;
     let finalApprovalResolution = trustedApprovalResolution;
-    if (hookResult?.requireApproval) {
-      const approvalOutcome = await resolveBeforeToolCallApprovalOutcome({
-        result: hookResult,
-        approvalMode: args.approvalMode,
-        toolName,
-        ...(args.toolCallId ? { toolCallId: args.toolCallId } : {}),
-        ...(args.ctx ? { ctx: args.ctx } : {}),
-        signal: args.signal,
-        baseParams: policyAdjustedParams,
-      });
-      if (approvalOutcome) {
-        if (approvalOutcome.blocked) {
-          return approvalOutcome;
-        }
-        if (approvalOutcome.deferredApproval) {
-          return approvalOutcome;
-        }
-        finalParams = approvalOutcome.params;
-        finalApprovalResolution = approvalOutcome.approvalResolution ?? finalApprovalResolution;
-      }
-    }
+    let ownerDecisionMarked = false;
+    if (hasBeforeToolCallHooks) {
+      const hookParamsValue = trustedApprovalBoundary
+        ? cloneHookIsolationValue("before_tool_call", approvedParamsSnapshot)
+        : policyAdjustedParams;
+      const hookEventParams = isPlainObject(hookParamsValue) ? hookParamsValue : {};
+      const callerIdentity = getGatewayToolCallerIdentity();
+      const receipt =
+        callerIdentity?.executionIdentityToken && callerIdentity.receiptAuthority
+          ? {
+              token: callerIdentity.executionIdentityToken,
+              assertAuthority: callerIdentity.receiptAuthority,
+              markOwnerDecision: () => {
+                ownerDecisionMarked = true;
+              },
+            }
+          : undefined;
+      const hookResult = await hookRunner.runBeforeToolCall(
+        {
+          toolName,
+          params: hookEventParams,
+          ...policyAdjustedToolIdentity,
+          ...(args.ctx?.runId && { runId: args.ctx.runId }),
+          ...(args.toolCallId && { toolCallId: args.toolCallId }),
+          ...(policyAdjustedDerivedToolParams.derivedPaths
+            ? { derivedPaths: policyAdjustedDerivedToolParams.derivedPaths }
+            : {}),
+        },
+        policyAdjustedToolContext,
+        receipt,
+      );
 
-    if (hookResult?.params) {
-      finalParams = mergeParamsWithApprovalOverrides(finalParams, hookResult.params);
-    }
-    const finalApprovalOutcome = await resolveSkillWorkshopApprovalForFinalParams({
-      toolName,
-      params: finalParams,
-      approvalMode: args.approvalMode,
-      ...(args.toolCallId ? { toolCallId: args.toolCallId } : {}),
-      ...(args.ctx ? { ctx: args.ctx } : {}),
-      signal: args.signal,
-    });
-    if (finalApprovalOutcome) {
-      return finalApprovalOutcome;
+      if (hookResult?.block) {
+        return {
+          blocked: true,
+          kind: "veto",
+          deniedReason: "plugin-before-tool-call",
+          reason: hookResult.blockReason || "Tool call blocked by plugin hook",
+          params: policyAdjustedParams,
+        };
+      }
+
+      const rawHookCandidateParams =
+        hookResult?.params === undefined
+          ? isPlainObject(hookParamsValue)
+            ? hookEventParams
+            : approvedParamsSnapshot
+          : mergeParamsWithApprovalOverrides(hookEventParams, hookResult.params);
+      const hookCandidateParams =
+        hookResult?.params === undefined
+          ? rawHookCandidateParams
+          : reconcileCodeModeExecBeforeHookParams({
+              owner: { toolKind: args.toolKind },
+              originalParams: hookEventParams,
+              hookParams: hookEventParams,
+              adjustedParams: rawHookCandidateParams,
+            });
+      if (hookResult?.requireApproval) {
+        const approvalOutcome = await resolveBeforeToolCallApprovalOutcome({
+          result: trustedApprovalBoundary ? { ...hookResult, params: undefined } : hookResult,
+          approvalMode: args.approvalMode,
+          toolName,
+          ...(args.toolCallId ? { toolCallId: args.toolCallId } : {}),
+          ...(args.ctx ? { ctx: args.ctx } : {}),
+          signal: args.signal,
+          baseParams: trustedApprovalBoundary ? hookCandidateParams : policyAdjustedParams,
+        });
+        if (approvalOutcome) {
+          if (approvalOutcome.blocked) {
+            return approvalOutcome;
+          }
+          if (approvalOutcome.deferredApproval) {
+            return approvalOutcome;
+          }
+          finalParams = approvalOutcome.params;
+          finalApprovalResolution = approvalOutcome.approvalResolution ?? finalApprovalResolution;
+        }
+      } else if (
+        trustedApprovalBoundary &&
+        !isDeepStrictEqual(approvedParamsSnapshot, hookCandidateParams)
+      ) {
+        return {
+          blocked: true,
+          kind: "failure",
+          disposition: "blocked",
+          deniedReason: "plugin-approval",
+          reason: "Tool call parameters changed after trusted approval",
+          params: approvedParamsSnapshot,
+        };
+      }
+
+      if (!trustedApprovalBoundary && hookResult?.params) {
+        finalParams = reconcileCodeModeExecBeforeHookParams({
+          owner: { toolKind: args.toolKind },
+          originalParams: policyAdjustedParams,
+          hookParams: policyAdjustedParams,
+          adjustedParams: mergeParamsWithApprovalOverrides(finalParams, hookResult.params),
+        });
+      }
     }
     const allowed: HookOutcome = {
       blocked: false as const,
       params: finalParams,
     };
+    if (ownerDecisionMarked || finalApprovalResolution) {
+      markPrivateDecision(allowed, "ownerDecision");
+    }
     if (finalApprovalResolution) {
       allowed.approvalResolution = finalApprovalResolution;
     }
@@ -448,13 +348,5 @@ export async function runBeforeToolCallHook(args: {
       reason: BEFORE_TOOL_CALL_HOOK_FAILURE_REASON,
       params,
     };
-  } finally {
-    try {
-      releaseArgumentChurnPolicyWait?.();
-    } catch (err) {
-      log.warn(
-        `before_tool_call policy-wait release failed: tool=${toolName} error=${String(err)}`,
-      );
-    }
   }
 }

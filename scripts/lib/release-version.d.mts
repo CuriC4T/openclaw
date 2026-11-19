@@ -1,4 +1,4 @@
-export type ParsedReleaseVersion = {
+type ParsedReleaseVersion = {
   version: string;
   baseVersion: string;
   channel: "stable" | "alpha" | "beta";
@@ -9,15 +9,25 @@ export type ParsedReleaseVersion = {
   betaNumber?: number;
   correctionNumber?: number;
 };
-export type ReleaseTrain =
+
+type ReleaseTrain =
   | "alpha"
   | "beta"
   | "stable"
   | "extended-stable"
   | "unsupported-extended-stable-correction";
+
 export function parseReleaseVersion(version: string): ParsedReleaseVersion | null;
+export function parsePinnedReleaseVersion(version: string): string | null;
 export function classifyReleaseTrain(parsedVersion: ParsedReleaseVersion): ReleaseTrain;
+export function resolveReleaseTagPackageIdentity(
+  releaseTag: string,
+  packageVersion: string,
+): { releaseTag: string; baseTag: string | null };
 export function collectReleaseVersionFloorErrors(
   version: string | ParsedReleaseVersion | null,
 ): string[];
 export function compareReleaseVersions(left: string, right: string): number | null;
+export function isStableReleaseVersionAtLeast(version: string, minimum: string): boolean;
+
+export function validateRetiredLineReason(reason: unknown): string;

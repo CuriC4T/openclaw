@@ -1,7 +1,26 @@
-// Openai plugin module implements base url behavior.
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
+
+/** ChatGPT model-list URL. The backend gates models on the reported Codex client version. */
+export async function resolveOpenAICodexModelsEndpoint(): Promise<string> {
+  const { resolveProviderRequestPolicy } = await import("openclaw/plugin-sdk/provider-http");
+  const version = resolveProviderRequestPolicy({
+    provider: "openai",
+    baseUrl: OPENAI_CODEX_RESPONSES_BASE_URL,
+  }).attributionHeaders?.version;
+  // Match Responses attribution. Development placeholders can hide models or get HTTP 400.
+  const clientVersion =
+    version &&
+    Number(version.slice(0, 4)) >= 2026 &&
+    /^\d{4}\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/u.test(
+      version,
+    )
+      ? version
+      : "99.0.0";
+  return `${OPENAI_CODEX_RESPONSES_BASE_URL}/models?client_version=${encodeURIComponent(clientVersion)}`;
+}
+
 export const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
 
 type OpenAIEndpointKind = "unresolved" | "platform" | "chatgpt" | "custom" | "invalid";
@@ -76,14 +95,6 @@ export function isOpenAIApiBaseUrl(baseUrl?: string): boolean {
 
 export function isOpenAICodexBaseUrl(baseUrl?: string): boolean {
   return classifyOpenAIBaseUrl(baseUrl) === "chatgpt";
-}
-
-/** True only for an HTTPS OpenAI Platform endpoint eligible for native transport hooks. */
-export function isOpenAIHttpsApiBaseUrl(baseUrl?: string): boolean {
-  if (typeof baseUrl !== "string" || classifyOpenAIBaseUrl(baseUrl) !== "platform") {
-    return false;
-  }
-  return new URL(baseUrl.trim()).protocol === "https:";
 }
 
 export function canonicalizeCodexResponsesBaseUrl(baseUrl?: string): string | undefined {

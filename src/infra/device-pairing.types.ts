@@ -1,28 +1,19 @@
-// Persisted device pairing and bootstrap-token record shapes.
 // Leaf contract shared by the domain modules (device-pairing.ts,
 // device-bootstrap.ts) and the SQLite row mapper (device-pairing-store.ts);
 // keeping it import-free of both sides prevents module cycles.
-import type { DeviceBootstrapProfile } from "../shared/device-bootstrap-profile.js";
+import type { Static } from "typebox";
+import type { SchemaContract } from "../../packages/gateway-protocol/src/schema-contract.js";
+import type { DevicePairRequestedEventSchema } from "../../packages/gateway-protocol/src/schema/devices.js";
+import type {
+  DeviceBootstrapProfile,
+  PairingSetupAccess,
+} from "../shared/device-bootstrap-profile.js";
+import type { NodeHostStats } from "../shared/node-host-stats.js";
 
 /** Pending device pairing request awaiting owner approval. */
-export type DevicePairingPendingRequest = {
-  requestId: string;
-  deviceId: string;
-  publicKey: string;
-  displayName?: string;
-  platform?: string;
-  deviceFamily?: string;
-  clientId?: string;
-  clientMode?: string;
-  browserOrigin?: string;
-  role?: string;
-  roles?: string[];
-  scopes?: string[];
-  remoteIp?: string;
-  silent?: boolean;
-  isRepair?: boolean;
-  ts: number;
-};
+export type DevicePairingPendingRequest = SchemaContract<
+  Static<typeof DevicePairRequestedEventSchema>
+>;
 
 // Internal pending record. refreshedAtMs is a TTL keepalive stamped on refresh so an
 // actively retrying device keeps one pending request (and requestId) alive instead of
@@ -32,9 +23,23 @@ export type DevicePairingPendingRecord = DevicePairingPendingRequest & {
   refreshedAtMs?: number;
 };
 
+export type DevicePairingStoreState = {
+  pendingById: Record<string, DevicePairingPendingRecord>;
+  pairedByDeviceId: Record<string, PairedDevice>;
+};
+
+/** The signed membership listing that originally granted this node role. */
+export type OpenClawIdNodePairingProvenance = {
+  approvedVia: "openclaw-id-node";
+  peerKey: string;
+  authority: { clawId: string; rootPub: string; listedSeq: number };
+};
+
 /** Bearer token issued to one paired device role. */
 export type DeviceAuthToken = {
   token: string;
+  /** Node-role provenance survives token rotation, but ends with role removal. */
+  approval?: OpenClawIdNodePairingProvenance;
   role: string;
   scopes: string[];
   issuer?: {
@@ -54,6 +59,7 @@ export type DeviceAuthToken = {
  * and "ssh-verified" are also non-interactive but cross hosts, so they are
  * never pruned automatically (display metadata is not a machine identity).
  * "trusted-proxy" records were approved from an authenticated proxy identity.
+ * "remote-ingress" records were approved through a live plugin grant.
  * "owner" and "bootstrap" approvals required a user action. None of these
  * cross-host or interactive approval kinds are pruned automatically.
  */
@@ -62,7 +68,9 @@ export type PairedDeviceApprovalKind =
   | "silent"
   | "trusted-cidr"
   | "trusted-proxy"
+  | "remote-ingress"
   | "ssh-verified"
+  | "openclaw-id-node"
   | "bootstrap";
 
 /**
@@ -82,9 +90,13 @@ export type PairedDeviceNodeSurface = {
   commands?: string[];
   permissions?: Record<string, boolean>;
   bins?: string[];
+  /** Last current-generation runner publication explicitly enabled session hosting. */
+  sessionHost?: boolean;
   createdAtMs: number;
   approvedAtMs: number;
   lastConnectedAtMs?: number;
+  lastDisconnectedAtMs?: number;
+  lastHostStats?: NodeHostStats;
 };
 
 /**
@@ -115,21 +127,12 @@ export type PairedDevicePendingNodeSurface = {
 };
 
 /** Persisted approved device record, including durable approval and active role tokens. */
-export type PairedDevice = {
-  deviceId: string;
-  publicKey: string;
-  displayName?: string;
+export type PairedDevice = Omit<
+  DevicePairingPendingRequest,
+  "requestId" | "silent" | "isRepair" | "ts"
+> & {
   operatorLabel?: string;
-  platform?: string;
-  deviceFamily?: string;
-  clientId?: string;
-  clientMode?: string;
-  browserOrigin?: string;
-  role?: string;
-  roles?: string[];
-  scopes?: string[];
   approvedScopes?: string[];
-  remoteIp?: string;
   tokens?: Record<string, DeviceAuthToken>;
   approvedVia?: PairedDeviceApprovalKind;
   nodeSurface?: PairedDeviceNodeSurface;
@@ -143,6 +146,7 @@ export type PairedDevice = {
 /** Persisted bootstrap token state, including binding and role/scope redemption progress. */
 export type DeviceBootstrapTokenRecord = {
   token: string;
+  setupId?: string;
   ts: number;
   deviceId?: string;
   publicKey?: string;
@@ -151,4 +155,19 @@ export type DeviceBootstrapTokenRecord = {
   pendingProfile?: DeviceBootstrapProfile;
   issuedAtMs: number;
   lastUsedAtMs?: number;
+};
+
+/**
+ * Durable terminal outcome for one setup credential. Redemption deletes the
+ * bootstrap row, so this record is what lets a presenting client answer
+ * "did my setup code succeed?" without having received the broadcast.
+ */
+export type DevicePairSetupCompletionRecord = {
+  setupId: string;
+  deviceId: string;
+  deviceName?: string;
+  access: PairingSetupAccess;
+  completedAtMs: number;
+  deliveryState: "uncertain" | "confirmed";
+  retainUntilMs: number;
 };

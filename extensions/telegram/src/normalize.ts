@@ -1,46 +1,48 @@
-// Telegram helper module supports normalize behavior.
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizeTelegramLookupTarget, parseTelegramTarget } from "./targets.js";
+import { buildTelegramConversationId, resolveTelegramTargetThread } from "./topic-conversation.js";
 
 const TELEGRAM_PREFIX_RE = /^(telegram|tg):/i;
 
-function normalizeTelegramTargetBody(raw: string): string | undefined {
+export function normalizeTelegramMessagingTarget(raw: string): string | undefined {
   const trimmed = raw.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-
   const prefixStripped = trimmed.replace(TELEGRAM_PREFIX_RE, "").trim();
-  if (!prefixStripped) {
+  const identity = resolveTelegramTargetIdentity(trimmed);
+  if (!identity) {
     return undefined;
   }
 
-  const parsed = parseTelegramTarget(trimmed);
-  const normalizedChatId = normalizeTelegramLookupTarget(parsed.chatId);
-  if (!normalizedChatId) {
-    return undefined;
-  }
-
-  const keepLegacyGroupPrefix = /^group:/i.test(prefixStripped);
-  const hasTopicSuffix = /:topic:\d+$/i.test(prefixStripped);
-  const chatSegment = keepLegacyGroupPrefix ? `group:${normalizedChatId}` : normalizedChatId;
-  if (parsed.messageThreadId == null) {
-    return chatSegment;
-  }
-  const threadSuffix = hasTopicSuffix
-    ? `:topic:${parsed.messageThreadId}`
-    : `:${parsed.messageThreadId}`;
-  return `${chatSegment}${threadSuffix}`;
+  const body = buildTelegramConversationId({
+    chatId: identity.chatId,
+    thread: resolveTelegramTargetThread(identity),
+  });
+  return `telegram:${/^group:/i.test(prefixStripped) ? "group:" : ""}${body}`;
 }
 
-export function normalizeTelegramMessagingTarget(raw: string): string | undefined {
-  const normalizedBody = normalizeTelegramTargetBody(raw);
-  if (!normalizedBody) {
+function resolveTelegramTargetIdentity(raw: string) {
+  const parsed = parseTelegramTarget(raw);
+  const chatId = normalizeTelegramLookupTarget(parsed.chatId);
+  if (!chatId) {
     return undefined;
   }
-  return normalizeLowercaseStringOrEmpty(`telegram:${normalizedBody}`);
+  return {
+    chatId: chatId.toLowerCase(),
+    messageThreadId: parsed.messageThreadId,
+    directMessagesTopicId: parsed.directMessagesTopicId,
+  };
 }
 
 export function looksLikeTelegramTargetId(raw: string): boolean {
-  return normalizeTelegramTargetBody(raw) !== undefined;
+  return resolveTelegramTargetIdentity(raw) !== undefined;
+}
+
+export function telegramMessagingTargetsMatch(target: string, currentTarget: string): boolean {
+  const targetIdentity = resolveTelegramTargetIdentity(target);
+  const currentIdentity = resolveTelegramTargetIdentity(currentTarget);
+  return (
+    targetIdentity !== undefined &&
+    currentIdentity !== undefined &&
+    targetIdentity.chatId === currentIdentity.chatId &&
+    targetIdentity.messageThreadId === currentIdentity.messageThreadId &&
+    targetIdentity.directMessagesTopicId === currentIdentity.directMessagesTopicId
+  );
 }

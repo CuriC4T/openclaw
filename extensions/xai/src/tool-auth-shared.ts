@@ -1,18 +1,15 @@
-// Xai plugin module implements tool auth shared behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { canResolveEnvSecretRefInReadOnlyPath } from "openclaw/plugin-sdk/extension-shared";
+import { resolveProviderWebSearchPluginConfig } from "openclaw/plugin-sdk/provider-web-search-config-contract";
 import {
   coerceSecretRef,
-  resolveNonEnvSecretRefApiKeyMarker,
-} from "openclaw/plugin-sdk/provider-auth";
-import {
-  readProviderEnvValue,
-  resolveProviderWebSearchPluginConfig,
-} from "openclaw/plugin-sdk/provider-web-search";
-import {
   normalizeSecretInputString,
-  resolveSecretInputString,
+  readProviderEnvValue,
+  resolveNonEnvSecretRefApiKeyMarker,
 } from "openclaw/plugin-sdk/secret-input";
+import {
+  resolveReadOnlyEnvSecretRef,
+  type ReadOnlyEnvSecretRefResolution,
+} from "openclaw/plugin-sdk/secret-ref-readonly";
 
 type XaiFallbackAuth = {
   apiKey: string;
@@ -21,15 +18,31 @@ type XaiFallbackAuth = {
 const XAI_API_KEY_ENV_VAR = "XAI_API_KEY";
 const XAI_PROVIDER_ID = "xai";
 
+type XaiToolAuthQuery = { credentialType?: "api_key" | "oauth" | "token" };
+
 export type XaiToolAuthContext = {
-  hasAuthForProvider?: (providerId: string) => boolean;
-  resolveApiKeyForProvider?: (providerId: string) => Promise<string | undefined>;
+  hasAuthForProvider?: (providerId: string, query?: XaiToolAuthQuery) => boolean;
+  resolveApiKeyForProvider?: (
+    providerId: string,
+    query?: XaiToolAuthQuery,
+  ) => Promise<string | undefined>;
 };
 
-type ConfiguredRuntimeApiKeyResolution =
-  | { status: "available"; value: string }
-  | { status: "missing" }
-  | { status: "blocked" };
+const XAI_SUBSCRIPTION_AUTH_QUERY: XaiToolAuthQuery = { credentialType: "oauth" };
+
+/** Grok OAuth signs in with the user's SuperGrok/X Premium subscription, not Console API credits. */
+export function hasXaiSubscriptionToolAuth(auth?: XaiToolAuthContext): boolean {
+  return auth?.hasAuthForProvider?.(XAI_PROVIDER_ID, XAI_SUBSCRIPTION_AUTH_QUERY) === true;
+}
+
+/** Resolves only a Grok OAuth credential; configured keys, API-key profiles and env never substitute. */
+export async function resolveXaiSubscriptionToolApiKey(
+  auth?: XaiToolAuthContext,
+): Promise<string | undefined> {
+  return normalizeSecretInputString(
+    await auth?.resolveApiKeyForProvider?.(XAI_PROVIDER_ID, XAI_SUBSCRIPTION_AUTH_QUERY),
+  );
+}
 
 function readConfiguredOrManagedApiKey(value: unknown): string | undefined {
   const literal = normalizeSecretInputString(value);
@@ -40,70 +53,25 @@ function readConfiguredOrManagedApiKey(value: unknown): string | undefined {
   return ref ? resolveNonEnvSecretRefApiKeyMarker(ref.source) : undefined;
 }
 
-function readConfiguredRuntimeApiKey(
-  value: unknown,
-  path: string,
-  cfg?: OpenClawConfig,
-): ConfiguredRuntimeApiKeyResolution {
-  const resolved = resolveSecretInputString({
-    value,
-    path,
-    defaults: cfg?.secrets?.defaults,
-    mode: "inspect",
-  });
-  if (resolved.status === "available") {
-    return { status: "available", value: resolved.value };
-  }
-  if (resolved.status === "missing") {
-    return { status: "missing" };
-  }
-  if (resolved.ref.source !== "env") {
-    return { status: "blocked" };
-  }
-  const envVarName = resolved.ref.id.trim();
-  if (envVarName !== XAI_API_KEY_ENV_VAR) {
-    return { status: "blocked" };
-  }
-  if (
-    !canResolveEnvSecretRefInReadOnlyPath({
-      cfg,
-      provider: resolved.ref.provider,
-      id: envVarName,
-    })
-  ) {
-    return { status: "blocked" };
-  }
-  const envValue = normalizeSecretInputString(process.env[envVarName]);
-  return envValue ? { status: "available", value: envValue } : { status: "missing" };
-}
-
-function readPluginXaiWebSearchApiKeyResult(
-  cfg?: OpenClawConfig,
-): ConfiguredRuntimeApiKeyResolution {
-  return readConfiguredRuntimeApiKey(
-    resolveProviderWebSearchPluginConfig(cfg as Record<string, unknown> | undefined, "xai")?.apiKey,
-    "plugins.entries.xai.config.webSearch.apiKey",
+function readPluginXaiWebSearchApiKeyResult(cfg?: OpenClawConfig): ReadOnlyEnvSecretRefResolution {
+  return resolveReadOnlyEnvSecretRef({
+    value: resolveProviderWebSearchPluginConfig(cfg as Record<string, unknown> | undefined, "xai")
+      ?.apiKey,
+    path: "plugins.entries.xai.config.webSearch.apiKey",
     cfg,
-  );
+    expectedEnvId: XAI_API_KEY_ENV_VAR,
+    normalizeValue: normalizeSecretInputString,
+  });
 }
 
 function resolveConfiguredXaiToolApiKeyResult(params: {
   runtimeConfig?: OpenClawConfig;
   sourceConfig?: OpenClawConfig;
-}): ConfiguredRuntimeApiKeyResolution {
+}): ReadOnlyEnvSecretRefResolution {
   const runtimePlugin = readPluginXaiWebSearchApiKeyResult(params.runtimeConfig);
-  if (runtimePlugin.status === "available" || runtimePlugin.status === "blocked") {
-    return runtimePlugin;
-  }
-  const sourcePlugin = readPluginXaiWebSearchApiKeyResult(params.sourceConfig);
-  if (sourcePlugin.status === "available" || sourcePlugin.status === "blocked") {
-    return sourcePlugin;
-  }
-  return { status: "missing" };
-}
-
-function hasXaiAuthProfile(auth?: XaiToolAuthContext): boolean {
-  return auth?.hasAuthForProvider?.(XAI_PROVIDER_ID) === true;
+  return runtimePlugin.status === "missing"
+    ? readPluginXaiWebSearchApiKeyResult(params.sourceConfig)
+    : runtimePlugin;
 }
 
 async function resolveXaiAuthProfileApiKey(auth?: XaiToolAuthContext): Promise<string | undefined> {
@@ -157,5 +125,8 @@ export function isXaiToolEnabled(params: {
   if (configured.status === "blocked") {
     return false;
   }
-  return hasXaiAuthProfile(params.auth) || Boolean(readProviderEnvValue([XAI_API_KEY_ENV_VAR]));
+  return (
+    params.auth?.hasAuthForProvider?.(XAI_PROVIDER_ID) === true ||
+    Boolean(readProviderEnvValue([XAI_API_KEY_ENV_VAR]))
+  );
 }

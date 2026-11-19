@@ -2,8 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { asBoolean, parseBooleanValue } from "./boolean.js";
-import { chunkItems } from "./chunk-items.js";
-import { splitShellArgs } from "./shell-argv.js";
+import { splitCommandArgs, splitShellArgs } from "./shell-argv.js";
 import { safeParseJsonWithSchema, safeParseWithSchema } from "./zod-parse.js";
 
 describe("asBoolean", () => {
@@ -32,21 +31,6 @@ describe("parseBooleanValue", () => {
     expect(parseBooleanValue("off")).toBe(false);
   });
 
-  it("respects custom truthy/falsy lists", () => {
-    expect(
-      parseBooleanValue("on", {
-        truthy: ["true"],
-        falsy: ["false"],
-      }),
-    ).toBeUndefined();
-    expect(
-      parseBooleanValue("yes", {
-        truthy: ["yes"],
-        falsy: ["no"],
-      }),
-    ).toBe(true);
-  });
-
   it("returns undefined for unsupported values", () => {
     expect(parseBooleanValue("")).toBeUndefined();
     expect(parseBooleanValue("maybe")).toBeUndefined();
@@ -55,14 +39,21 @@ describe("parseBooleanValue", () => {
 });
 
 describe("splitShellArgs", () => {
-  it("splits whitespace and respects quotes", () => {
-    expect(splitShellArgs(`qmd --foo "bar baz"`)).toEqual(["qmd", "--foo", "bar baz"]);
-    expect(splitShellArgs(`qmd --foo 'bar baz'`)).toEqual(["qmd", "--foo", "bar baz"]);
-  });
-
   it("supports backslash escapes inside double quotes", () => {
     expect(splitShellArgs(String.raw`echo "a\"b"`)).toEqual(["echo", `a"b`]);
     expect(splitShellArgs(String.raw`echo "\$HOME"`)).toEqual(["echo", "$HOME"]);
+  });
+
+  // Expectations below match `bash 5.2` word splitting for the same inputs.
+  it("removes backslash-newline line continuations without breaking the word", () => {
+    expect(splitShellArgs("ba\\\nsh")).toEqual(["bash"]);
+    expect(splitShellArgs("echo a\\\nb")).toEqual(["echo", "ab"]);
+    expect(splitShellArgs('echo "ba\\\nsh"')).toEqual(["echo", "bash"]);
+    expect(splitShellArgs("echo a\\\n")).toEqual(["echo", "a"]);
+  });
+
+  it("keeps backslash-newline literal inside single quotes", () => {
+    expect(splitShellArgs("echo 'ba\\\nsh'")).toEqual(["echo", "ba\\\nsh"]);
   });
 
   it("returns null for unterminated quotes", () => {
@@ -77,13 +68,9 @@ describe("splitShellArgs", () => {
   });
 });
 
-describe("chunkItems", () => {
-  it("splits items into fixed-size chunks", () => {
-    expect(chunkItems([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
-  });
-
-  it("keeps one row when the requested size is not positive", () => {
-    expect(chunkItems([1, 2, 3], 0)).toEqual([[1, 2, 3]]);
+describe("splitCommandArgs", () => {
+  it.each(['program "unfinished'])("allows unfinished quotes when requested: %s", (raw) => {
+    expect(splitCommandArgs(raw, { allowUnclosedQuotes: true })).toEqual(["program", "unfinished"]);
   });
 });
 

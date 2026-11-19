@@ -1,39 +1,57 @@
-// @vitest-environment node
-
 import type { RouteLoaderOptions } from "@openclaw/uirouter";
-import { describe, expect, it, vi } from "vitest";
+// @vitest-environment node
+import { assert, expect, it, vi } from "vitest";
+import { SIDEBAR_SESSION_ROSTER_LIMIT } from "../../../../src/shared/session-list-limits.ts";
 import type { ApplicationContext } from "../../app/context.ts";
+import { sessionListResult } from "../../test-helpers/chat-model.ts";
+import { createRouteLoaderOptions } from "../../test-helpers/route-loader-options.ts";
 import { page } from "./route.ts";
 
-const loaderOptions: RouteLoaderOptions = {
-  signal: new AbortController().signal,
-  shouldRun: () => true,
-  revalidating: false,
-  location: { pathname: "/dashboards", search: "", hash: "" },
-  deps: "",
-  cause: "navigation",
-};
+const loaderOptions: RouteLoaderOptions = createRouteLoaderOptions({
+  pathname: "/dashboards",
+  search: "",
+  hash: "",
+});
 
-describe("dashboards route", () => {
-  it("requests the dashboard face from the server before pagination", async () => {
-    const list = vi.fn(async () => null);
+it.each([undefined, "global", "per-sender"] as const)(
+  "seeds the managed dashboards query and configured scope %s",
+  async (scope) => {
+    const result = sessionListResult(1, []);
+    let snapshot = {
+      result: null as typeof result | null,
+      agentId: null,
+      loading: false,
+      error: null,
+    };
+    const list = vi.fn();
+    const listSnapshot = vi.fn(() => snapshot);
+    const refreshList = vi.fn(async () => {
+      snapshot = { ...snapshot, result };
+    });
     const context = {
       basePath: "",
-      sessions: { list, canonicalListRevision: 4 },
+      sessions: { list, listSnapshot, refreshList },
       agentSelection: { state: { selectedId: "main", scopeId: null } },
-      agents: { state: { agentsList: null } },
+      agents: {
+        state: { agentsList: scope ? { defaultId: "main", mainKey: "main", scope } : null },
+      },
       gateway: { snapshot: { hello: null } },
     } as unknown as ApplicationContext;
-    if (!page.loader) {
-      throw new Error("dashboards route has no loader");
-    }
 
-    await page.loader(context, loaderOptions);
+    const data = await page.loader!(context, loaderOptions);
+    assert(!("type" in data), "Dashboards should load data without redirecting");
+    expect(data.globalScope).toBe(scope === "global");
 
-    expect(list).toHaveBeenCalledWith({
-      limit: 50,
-      boardFace: "dashboard",
+    const query = {
+      limit: SIDEBAR_SESSION_ROSTER_LIMIT,
+      rowMode: "dashboard",
+      source: "dashboard",
+      excludeDock: true,
+      hasBoard: true,
       archivedFilter: "all",
-    });
-  });
-});
+    };
+    expect(refreshList).toHaveBeenCalledWith(query);
+    expect(listSnapshot).toHaveBeenLastCalledWith(query);
+    expect(list).not.toHaveBeenCalled();
+  },
+);

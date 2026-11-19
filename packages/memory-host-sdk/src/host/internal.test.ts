@@ -4,7 +4,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
+import { estimateStringChars } from "@openclaw/normalization-core/cjk-chars";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../../test/helpers/promise.js";
 import {
   buildFileEntry,
   buildMultimodalChunkForIndexing,
@@ -12,17 +14,14 @@ import {
   ensureDir,
   isMemoryPath,
   listMemoryFiles,
+  normalizeExtraMemoryPathEntries,
   normalizeExtraMemoryPaths,
   remapChunkLines,
   runWithConcurrency,
   stripMemoryAnnotationCarriers,
 } from "./internal.js";
 import { normalizeMemoryMultimodalSettings, type MemoryMultimodalSettings } from "./multimodal.js";
-
-type FileEntry = NonNullable<Awaited<ReturnType<typeof buildFileEntry>>>;
-type MultimodalIndexingChunk = NonNullable<
-  Awaited<ReturnType<typeof buildMultimodalChunkForIndexing>>
->;
+import { readMemoryFile } from "./read-file.js";
 
 let sharedTempRoot = "";
 let sharedTempId = 0;
@@ -50,29 +49,17 @@ function setupTempDirLifecycle(prefix: string): () => string {
   return () => tmpDir;
 }
 
-function expectFileEntry(entry: Awaited<ReturnType<typeof buildFileEntry>>): FileEntry {
-  if (!entry) {
-    throw new Error("Expected file entry to be built");
+function tryCreateSymlink(target: string, linkPath: string, type?: "dir"): boolean {
+  try {
+    fsSync.symlinkSync(target, linkPath, type);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES") {
+      return false;
+    }
+    throw err;
   }
-  return entry;
-}
-
-function expectMultimodalIndexingChunk(
-  built: Awaited<ReturnType<typeof buildMultimodalChunkForIndexing>>,
-): MultimodalIndexingChunk {
-  if (!built) {
-    throw new Error("Expected multimodal indexing chunk to be built");
-  }
-  return built;
-}
-
-function expectEmbeddingInput(
-  chunk: MultimodalIndexingChunk["chunk"],
-): NonNullable<MultimodalIndexingChunk["chunk"]["embeddingInput"]> {
-  if (!chunk.embeddingInput) {
-    throw new Error("Expected multimodal chunk embedding input");
-  }
-  return chunk.embeddingInput;
 }
 
 const multimodal: MemoryMultimodalSettings = normalizeMemoryMultimodalSettings({ enabled: true });
@@ -80,19 +67,75 @@ const multimodal: MemoryMultimodalSettings = normalizeMemoryMultimodalSettings({
 describe("memory host SDK package internals", () => {
   const getTmpDir = setupTempDirLifecycle("memory-package-");
 
+  it.skipIf(process.platform === "win32")(
+    "rejects an uppercase explicit extra file on case-sensitive hosts",
+    async () => {
+      const tmpDir = getTmpDir();
+      const workspaceDir = path.join(tmpDir, "workspace");
+      const upperPath = path.join(tmpDir, "NOTES.MD");
+      await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+      await fs.writeFile(upperPath, "not lowercase Markdown", "utf8");
+
+      await expect(listMemoryFiles(workspaceDir, [upperPath])).resolves.toEqual([]);
+      await expect(
+        readMemoryFile({ workspaceDir, extraPaths: [upperPath], relPath: upperPath }),
+      ).rejects.toThrow("path is not an allowed Markdown memory file");
+    },
+  );
+
+  it("bounds canonical reads and preserves discovery order when aliases settle out of order", async () => {
+    const workspaceDir = getTmpDir();
+    const memoryDir = path.join(workspaceDir, "memory");
+    await fs.mkdir(memoryDir);
+    const files = Array.from({ length: 6 }, (_, index) => path.join(memoryDir, `${index}.md`));
+    await Promise.all(files.map((file) => fs.writeFile(file, "memory")));
+    const gates = files.map(() => Promise.withResolvers<string>());
+    const originalRealpath = fs.realpath.bind(fs);
+    const started: number[] = [];
+    let active = 0;
+    let maximum = 0;
+    vi.spyOn(fs, "realpath").mockImplementation(async (file, options) => {
+      const index = files.indexOf(String(file));
+      if (index < 0) {
+        return originalRealpath(file, options);
+      }
+      started.push(index);
+      maximum = Math.max(maximum, ++active);
+      try {
+        return await gates[index]!.promise;
+      } finally {
+        active--;
+      }
+    });
+    const listing = listMemoryFiles(workspaceDir);
+    try {
+      await vi.waitFor(() => expect(started).toHaveLength(4));
+      expect(maximum).toBe(4);
+      gates[1]!.resolve(files[0]!);
+      gates[3]!.reject(new Error("file disappeared"));
+      await vi.waitFor(() => expect(started).toHaveLength(6));
+      gates[5]!.resolve(files[5]!);
+      gates[4]!.resolve(files[4]!);
+      gates[2]!.resolve(files[2]!);
+      gates[0]!.resolve(files[0]!);
+      await expect(listing).resolves.toEqual(files.filter((_, index) => index !== 1));
+      expect(maximum).toBe(4);
+    } finally {
+      gates.forEach((gate, index) => gate.resolve(files[index]!));
+      await listing;
+    }
+  });
+
   it("drains in-flight work before propagating a concurrency failure", async () => {
     const failure = new Error("embedding failed");
-    let releaseTask!: () => void;
-    const release = new Promise<void>((resolve) => {
-      releaseTask = resolve;
-    });
+    const release = createDeferred();
     const started: number[] = [];
     const completed: number[] = [];
     const run = runWithConcurrency(
       [
         async () => {
           started.push(0);
-          await release;
+          await release.promise;
           completed.push(0);
           return 0;
         },
@@ -114,7 +157,7 @@ describe("memory host SDK package internals", () => {
     await Promise.resolve();
     expect(onSettled).not.toHaveBeenCalled();
 
-    releaseTask();
+    release.resolve();
     await expect(run).rejects.toBe(failure);
     expect(completed).toEqual([0]);
     expect(started).toEqual([0, 1]);
@@ -123,12 +166,11 @@ describe("memory host SDK package internals", () => {
   it("propagates directory creation failures", () => {
     const mkdirError = new Error("disk full");
     const targetDir = path.join(getTmpDir(), "blocked");
-    const mkdirSync = vi.spyOn(fsSync, "mkdirSync").mockImplementation(() => {
+    vi.spyOn(fsSync, "mkdirSync").mockImplementation(() => {
       throw mkdirError;
     });
 
     expect(() => ensureDir(targetDir)).toThrow(mkdirError);
-    expect(mkdirSync).toHaveBeenCalledWith(targetDir, { recursive: true });
   });
 
   it("normalizes additional memory paths", () => {
@@ -150,6 +192,18 @@ describe("memory host SDK package internals", () => {
       path.join(os.homedir(), "shared-notes"),
       os.homedir(),
     ]);
+    expect(
+      normalizeExtraMemoryPathEntries(workspaceDir, [
+        { path: " notes ", pattern: " runbooks/**/*.md " },
+        { path: "notes", pattern: "runbooks/**/*.md" },
+        { path: "notes", pattern: "archive/**/*.md" },
+        { path: "reference", evergreen: true },
+      ]),
+    ).toEqual([
+      { path: path.resolve(workspaceDir, "notes"), pattern: "runbooks/**/*.md" },
+      { path: path.resolve(workspaceDir, "notes"), pattern: "archive/**/*.md" },
+      { path: path.resolve(workspaceDir, "reference"), evergreen: true },
+    ]);
   });
 
   it("lists canonical markdown and enabled multimodal files", async () => {
@@ -157,6 +211,9 @@ describe("memory host SDK package internals", () => {
     fsSync.writeFileSync(path.join(tmpDir, "MEMORY.md"), "# Default memory");
     fsSync.writeFileSync(path.join(tmpDir, "USER.md"), "# User profile");
     fsSync.writeFileSync(path.join(tmpDir, "memory.md"), "# Legacy memory");
+    const defaultMemoryDir = path.join(tmpDir, "memory");
+    fsSync.mkdirSync(defaultMemoryDir, { recursive: true });
+    fsSync.writeFileSync(path.join(defaultMemoryDir, "default-diagram.png"), Buffer.from("png"));
     const extraDir = path.join(tmpDir, "extra");
     fsSync.mkdirSync(extraDir, { recursive: true });
     fsSync.writeFileSync(path.join(extraDir, "note.md"), "# Note");
@@ -179,6 +236,301 @@ describe("memory host SDK package internals", () => {
     ]);
   });
 
+  it.each([
+    {
+      label: "primary memory file",
+      target: (workspaceDir: string) => path.join(workspaceDir, "USER.md"),
+      extraPaths: (_workspaceDir: string) => undefined,
+    },
+    {
+      label: "workspace memory directory",
+      target: (workspaceDir: string) => path.join(workspaceDir, "memory"),
+      extraPaths: (_workspaceDir: string) => undefined,
+    },
+    {
+      label: "configured extra path",
+      target: (workspaceDir: string) => path.join(workspaceDir, "extra"),
+      extraPaths: (workspaceDir: string) => [path.join(workspaceDir, "extra")],
+    },
+  ])("propagates operational scan failures for $label", async ({ target, extraPaths }) => {
+    const workspaceDir = getTmpDir();
+    const failedPath = target(workspaceDir);
+    const scanError = Object.assign(new Error(`I/O failure: ${failedPath}`), { code: "EIO" });
+    const realLstat = fs.lstat;
+    vi.spyOn(fs, "lstat").mockImplementation(
+      async (...args: Parameters<typeof fs.lstat>): ReturnType<typeof fs.lstat> => {
+        if (path.resolve(String(args[0])) === failedPath) {
+          throw scanError;
+        }
+        return await realLstat(...args);
+      },
+    );
+
+    await expect(listMemoryFiles(workspaceDir, extraPaths(workspaceDir))).rejects.toMatchObject({
+      name: "MemorySourceScanError",
+      path: failedPath,
+      code: "EIO",
+      cause: scanError,
+      message: `memory source scan failed at ${failedPath} (EIO): I/O failure: ${failedPath}`,
+    });
+  });
+
+  it.each([
+    ["workspace", "", "EIO", "I/O failure"],
+    ["memory", "memory", "EIO", "I/O failure"],
+    ["nested", "memory/nested", "EACCES", "permission denied"],
+  ])("names the %s directory that blocks a memory scan", async (_, relativePath, code, message) => {
+    const workspaceDir = getTmpDir();
+    const failedPath = path.join(workspaceDir, relativePath);
+    await fs.mkdir(path.join(workspaceDir, "memory", "nested"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "memory", "ok.md"), "# ok\n");
+    const scanError = Object.assign(new Error(message), { code });
+    const realReaddir = fs.readdir;
+    vi.spyOn(fs, "readdir").mockImplementation(async (...args: Parameters<typeof fs.readdir>) => {
+      if (path.resolve(String(args[0])) === failedPath) {
+        throw scanError;
+      }
+      return await realReaddir(...args);
+    });
+
+    await expect(listMemoryFiles(workspaceDir)).rejects.toMatchObject({
+      name: "MemorySourceScanError",
+      path: failedPath,
+      code,
+      cause: scanError,
+      message: `memory source scan failed at ${failedPath} (${code}): ${message}`,
+    });
+  });
+
+  it.each([
+    { directory: "notes", rootFile: "root.md" },
+    { directory: "..notes", rootFile: "..root.md" },
+    { directory: "...notes", rootFile: "...root.md" },
+  ])(
+    "filters $directory by glob while preserving symlink skips",
+    async ({ directory, rootFile }) => {
+      const tmpDir = getTmpDir();
+      const extraDir = path.join(tmpDir, "extra");
+      const outsideDir = path.join(tmpDir, "outside");
+      fsSync.mkdirSync(path.join(extraDir, directory, "nested"), { recursive: true });
+      fsSync.mkdirSync(path.join(extraDir, "drafts"), { recursive: true });
+      fsSync.mkdirSync(outsideDir, { recursive: true });
+      fsSync.writeFileSync(path.join(extraDir, rootFile), "root");
+      fsSync.writeFileSync(path.join(extraDir, directory, "keep.md"), "keep");
+      fsSync.writeFileSync(path.join(extraDir, directory, "nested", "keep.md"), "nested");
+      fsSync.writeFileSync(path.join(extraDir, "drafts", "skip.md"), "skip");
+      fsSync.writeFileSync(path.join(extraDir, directory, "ignore.txt"), "ignore");
+      fsSync.writeFileSync(path.join(outsideDir, "linked.md"), "linked");
+      tryCreateSymlink(
+        path.join(outsideDir, "linked.md"),
+        path.join(extraDir, directory, "linked.md"),
+      );
+      tryCreateSymlink(outsideDir, path.join(extraDir, directory, "linked-dir"), "dir");
+
+      const files = await listMemoryFiles(tmpDir, [
+        { path: extraDir, pattern: rootFile },
+        { path: extraDir, pattern: `${directory}/**/*.md` },
+      ]);
+
+      expect(files.map((file) => path.relative(extraDir, file)).toSorted()).toEqual(
+        [
+          path.join(directory, "keep.md"),
+          path.join(directory, "nested", "keep.md"),
+          rootFile,
+        ].toSorted(),
+      );
+    },
+  );
+
+  it.each([
+    {
+      label: "a union of root, wildcard, and trailing-globstar patterns",
+      patterns: ["*.md", "notes/*/*.md", "logs.cache/**"],
+      expectedFiles: ["root.md", "notes/team/keep.md", "logs.cache/deep/keep.md"],
+      expectedDirectories: ["", "notes", "notes/team", "logs.cache", "logs.cache/deep"],
+    },
+    {
+      label: "a bare globstar",
+      patterns: ["**"],
+      expectedFiles: [
+        "root.md",
+        "notes/team/keep.md",
+        "notes/team/deeper/keep.md",
+        "logs.cache/deep/keep.md",
+        "archive/deep/keep.md",
+        "scratch/deep/keep.md",
+      ],
+      expectedDirectories: undefined,
+    },
+    {
+      label: "brace alternatives containing separators and extglobs",
+      patterns: ["{notes,archive/deep}/**/*.md", "@(logs.cache|scratch)/**/*.md"],
+      expectedFiles: [
+        "notes/team/keep.md",
+        "notes/team/deeper/keep.md",
+        "logs.cache/deep/keep.md",
+        "archive/deep/keep.md",
+        "scratch/deep/keep.md",
+      ],
+      expectedDirectories: undefined,
+    },
+    {
+      label: "a globstar prefix without entering hidden directories",
+      patterns: ["**/team/*.md"],
+      expectedFiles: ["notes/team/keep.md"],
+      expectedDirectories: [
+        "",
+        "notes",
+        "notes/team",
+        "notes/team/deeper",
+        "logs.cache",
+        "logs.cache/deep",
+        "archive",
+        "archive/deep",
+        "scratch",
+        "scratch/deep",
+      ],
+    },
+    {
+      label: "an explicit hidden directory",
+      patterns: [".hidden/**/*.md"],
+      expectedFiles: [".hidden/deep/keep.md"],
+      expectedDirectories: ["", ".hidden", ".hidden/deep"],
+    },
+    {
+      label: "an explicit hidden file",
+      patterns: [".*.md"],
+      expectedFiles: [".secret.md"],
+      expectedDirectories: [""],
+    },
+    {
+      label: "an invalid pattern alongside a valid pattern",
+      patterns: ["x".repeat(65_537), "notes/team/*.md"],
+      expectedFiles: ["notes/team/keep.md"],
+      expectedDirectories: ["", "notes", "notes/team"],
+    },
+    {
+      label: "an unrestricted entry alongside a narrow pattern",
+      patterns: ["notes/team/*.md", undefined],
+      expectedFiles: [
+        "root.md",
+        ".secret.md",
+        "notes/team/keep.md",
+        "notes/team/deeper/keep.md",
+        "logs.cache/deep/keep.md",
+        "archive/deep/keep.md",
+        ".hidden/deep/keep.md",
+        "scratch/deep/keep.md",
+      ],
+      expectedDirectories: undefined,
+    },
+  ])(
+    "scans a shared extra root once for $label without losing matching files",
+    async ({ patterns, expectedFiles, expectedDirectories }) => {
+      const workspaceDir = getTmpDir();
+      const extraDir = path.join(workspaceDir, "extra");
+      const fixtureFiles = [
+        "root.md",
+        ".secret.md",
+        "notes/team/keep.md",
+        "notes/team/deeper/keep.md",
+        "logs.cache/deep/keep.md",
+        "archive/deep/keep.md",
+        ".hidden/deep/keep.md",
+        "scratch/deep/keep.md",
+      ];
+      for (const relativeFile of fixtureFiles) {
+        const file = path.join(extraDir, relativeFile);
+        fsSync.mkdirSync(path.dirname(file), { recursive: true });
+        fsSync.writeFileSync(file, "# Memory\n");
+      }
+      const readdir = vi.spyOn(fs, "readdir");
+
+      const files = await listMemoryFiles(
+        workspaceDir,
+        patterns.map((pattern) => ({ path: extraDir, pattern })),
+      );
+
+      expect(
+        files.map((file) => path.relative(extraDir, file).replaceAll(path.sep, "/")).toSorted(),
+      ).toEqual(expectedFiles.toSorted());
+      const scannedDirectories = readdir.mock.calls
+        .map(([dir]) => path.resolve(String(dir)))
+        .filter((dir) => dir === extraDir || dir.startsWith(`${extraDir}${path.sep}`));
+      if (expectedDirectories) {
+        expect(scannedDirectories.toSorted()).toEqual(
+          expectedDirectories.map((dir) => path.join(extraDir, dir)).toSorted(),
+        );
+      } else {
+        expect(scannedDirectories.filter((dir) => dir === extraDir)).toHaveLength(1);
+      }
+    },
+  );
+
+  it("requires an explicit dot pattern to authorize hidden extra memory files", async () => {
+    const workspaceDir = getTmpDir();
+    const extraDir = path.join(workspaceDir, "extra");
+    const hiddenFile = path.join(extraDir, ".secret.md");
+    await fs.mkdir(extraDir);
+    await fs.writeFile(hiddenFile, "private note");
+
+    await expect(
+      readMemoryFile({
+        workspaceDir,
+        extraPaths: [{ path: extraDir, pattern: "*.md" }],
+        relPath: hiddenFile,
+      }),
+    ).rejects.toMatchObject({ code: "MEMORY_PATH_NOT_ALLOWED" });
+    await expect(
+      readMemoryFile({
+        workspaceDir,
+        extraPaths: [{ path: extraDir, pattern: ".*.md" }],
+        relPath: hiddenFile,
+      }),
+    ).resolves.toMatchObject({ text: "private note" });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "skips a symlinked workspace root file instead of aborting enumeration",
+    async () => {
+      const tmpDir = getTmpDir();
+      const outsideDir = path.join(tmpDir, "outside");
+      fsSync.mkdirSync(outsideDir, { recursive: true });
+      fsSync.writeFileSync(path.join(outsideDir, "shared-user.md"), "# Outside user profile");
+      fsSync.writeFileSync(path.join(tmpDir, "USER.md"), "# placeholder, replaced below");
+      fsSync.unlinkSync(path.join(tmpDir, "USER.md"));
+      expect(
+        tryCreateSymlink(path.join(outsideDir, "shared-user.md"), path.join(tmpDir, "USER.md")),
+      ).toBe(true);
+      const memoryDir = path.join(tmpDir, "memory");
+      fsSync.mkdirSync(memoryDir, { recursive: true });
+      fsSync.writeFileSync(path.join(memoryDir, "notes.md"), "# Notes");
+
+      const files = await listMemoryFiles(tmpDir);
+
+      expect(files.map((file) => path.relative(tmpDir, file))).toEqual([
+        path.join("memory", "notes.md"),
+      ]);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "skips a symlink when building a file entry",
+    async () => {
+      const tmpDir = getTmpDir();
+      const outsideDir = path.join(tmpDir, "outside");
+      fsSync.mkdirSync(outsideDir, { recursive: true });
+      const realPath = path.join(outsideDir, "kept.md");
+      fsSync.writeFileSync(realPath, "# Kept");
+      const linkedPath = path.join(tmpDir, "linked.md");
+      expect(tryCreateSymlink(realPath, linkedPath)).toBe(true);
+
+      await expect(buildFileEntry(linkedPath, tmpDir)).resolves.toBeNull();
+      const entry = expectDefined(await buildFileEntry(realPath, tmpDir), "file entry");
+      expect(entry.path).toBe(path.relative(tmpDir, realPath));
+    },
+  );
+
   it("allows top-level dreams path casing variants", () => {
     expect(isMemoryPath("USER.md")).toBe(true);
     expect(isMemoryPath("dreams.md")).toBe(true);
@@ -195,10 +547,10 @@ describe("memory host SDK package internals", () => {
     const note = await buildFileEntry(notePath, tmpDir);
     const image = await buildFileEntry(imagePath, tmpDir, multimodal);
 
-    const noteEntry = expectFileEntry(note);
+    const noteEntry = expectDefined(note, "note entry");
     expect(noteEntry.path).toBe("note.md");
     expect(noteEntry.kind).toBe("markdown");
-    const imageEntry = expectFileEntry(image);
+    const imageEntry = expectDefined(image, "image entry");
     expect(imageEntry.path).toBe("diagram.png");
     expect(imageEntry.kind).toBe("multimodal");
     expect(imageEntry.modality).toBe("image");
@@ -229,7 +581,7 @@ describe("memory host SDK package internals", () => {
       });
 
     try {
-      const entry = expectFileEntry(await buildFileEntry(notePath, tmpDir));
+      const entry = expectDefined(await buildFileEntry(notePath, tmpDir), "note entry");
       expect(entry.path).toBe("note.md");
       expect(entry.kind).toBe("markdown");
       expect(attempts).toBe(2);
@@ -243,9 +595,9 @@ describe("memory host SDK package internals", () => {
     const imagePath = path.join(tmpDir, "diagram.png");
     fsSync.writeFileSync(imagePath, Buffer.from("png"));
 
-    const entry = expectFileEntry(await buildFileEntry(imagePath, tmpDir, multimodal));
-    const built = expectMultimodalIndexingChunk(await buildMultimodalChunkForIndexing(entry));
-    const parts = expectEmbeddingInput(built.chunk).parts ?? [];
+    const entry = expectDefined(await buildFileEntry(imagePath, tmpDir, multimodal), "image entry");
+    const built = expectDefined(await buildMultimodalChunkForIndexing(entry), "multimodal chunk");
+    const parts = expectDefined(built.chunk.embeddingInput, "embedding input").parts ?? [];
     expect(parts[0]).toEqual({ type: "text", text: "Image file: diagram.png" });
     const inlinePart = parts[1];
     if (inlinePart?.type !== "inline-data") {
@@ -257,23 +609,14 @@ describe("memory host SDK package internals", () => {
     await expect(buildMultimodalChunkForIndexing(entry)).resolves.toBeNull();
   });
 
-  it("chunks mixed text and preserves surrogate pairs", () => {
+  it("chunks mixed text", () => {
     const mixed = Array.from(
       { length: 30 },
       (_, index) => `Line ${index}: 这是中英文混合的测试内容 with English`,
     ).join("\n");
     const mixedChunks = chunkMarkdown(mixed, { tokens: 50, overlap: 0 });
     expect(mixedChunks.length).toBeGreaterThan(1);
-    expect(mixedChunks.map((chunk) => chunk.text).join("\n")).toContain("Line 29");
-
-    const surrogateChar = "\u{20000}";
-    const surrogateChunks = chunkMarkdown(surrogateChar.repeat(120), {
-      tokens: 31,
-      overlap: 0,
-    });
-    for (const chunk of surrogateChunks) {
-      expect(() => encodeURIComponent(chunk.text)).not.toThrow();
-    }
+    expect(mixedChunks.map((chunk) => chunk.text).join("\n")).toBe(mixed);
   });
 
   it("preserves a surrogate pair at the coarse split boundary", () => {
@@ -285,6 +628,63 @@ describe("memory host SDK package internals", () => {
     expect(chunks.map((chunk) => chunk.text).join("")).toBe(text);
     for (const chunk of chunks) {
       expect(() => encodeURIComponent(chunk.text)).not.toThrow();
+    }
+  });
+
+  it("keeps chunks within budget when overlap carries a long segment", () => {
+    // A 3000-char line is sliced into 1600-char segments; without a bounded
+    // carry the emitted chunk used to reach 3001 chars (budget 1600).
+    const chunks = chunkMarkdown("a".repeat(3000), { tokens: 400, overlap: 80 });
+
+    for (const chunk of chunks) {
+      expect(chunk.text.length).toBeLessThanOrEqual(1600);
+    }
+    expect(chunks.map((chunk) => chunk.text).join("")).toContain("a".repeat(100));
+  });
+
+  it("keeps chunks within budget for mixed short and long lines", () => {
+    const content = ["intro line", "b".repeat(3000), "outro line"].join("\n");
+
+    const chunks = chunkMarkdown(content, { tokens: 400, overlap: 80 });
+
+    for (const chunk of chunks) {
+      expect(chunk.text.length).toBeLessThanOrEqual(1600);
+    }
+    expect(chunks.map((chunk) => chunk.text).join("\n")).toContain("intro line");
+    expect(chunks.map((chunk) => chunk.text).join("\n")).toContain("outro line");
+  });
+
+  it("subtracts already retained entries from the carry window", () => {
+    const content = ["a".repeat(900), "b".repeat(100), "c".repeat(1450)].join("\n");
+
+    const chunks = chunkMarkdown(content, { tokens: 400, overlap: 80 });
+
+    for (const chunk of chunks) {
+      expect(chunk.text.length).toBeLessThanOrEqual(1600);
+    }
+  });
+
+  it.each([
+    { label: "common CJK", character: "中", count: 60, retained: 24 },
+    { label: "rare BMP CJK", character: "\u3400", count: 60, retained: 8 },
+    { label: "supplementary CJK", character: "\u{20000}", count: 60, retained: 6 },
+    { label: "emoji", character: "🌸", count: 60, retained: 49 },
+    { label: "lone high surrogates", character: "\ud800", count: 120, retained: 99 },
+    { label: "lone low surrogates", character: "\udc00", count: 120, retained: 99 },
+  ])("preserves the weighted overlap tail for $label", ({ character, count, retained }) => {
+    const firstLine = `${"a".repeat(600)}${character.repeat(count)}`;
+    const nextLine = "x".repeat(1499);
+    const content = [firstLine, nextLine].join("\n");
+
+    const chunks = chunkMarkdown(content, { tokens: 400, overlap: 80 });
+
+    // The 100-unit overlap window reserves one unit for its separator.
+    expect(chunks.map((chunk) => chunk.text)).toEqual([
+      firstLine,
+      `${character.repeat(retained)}\n${nextLine}`,
+    ]);
+    for (const chunk of chunks) {
+      expect(estimateStringChars(chunk.text)).toBeLessThanOrEqual(1600);
     }
   });
 

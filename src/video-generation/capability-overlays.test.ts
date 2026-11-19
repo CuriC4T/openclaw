@@ -1,169 +1,125 @@
-// Video capability overlay tests cover config-driven capability overrides.
-import { describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../config/types.js";
+import { expect, it, vi } from "vitest";
 import {
-  buildReferenceInputCapabilityFailure,
-  resolveProviderWithModelCapabilities,
-} from "./capability-overlays.js";
-import type { VideoGenerationProvider, VideoGenerationProviderCapabilities } from "./types.js";
+  DASHSCOPE_WAN_VIDEO_CAPABILITIES,
+  DASHSCOPE_WAN_VIDEO_CATALOG_BY_MODEL,
+} from "./dashscope-compatible.js";
+import type { VideoGenerationProvider } from "./provider-types.js";
+import { generateVideo, type GenerateVideoParams } from "./runtime.js";
+import type { VideoGenerationProviderCapabilities as Capabilities } from "./types.js";
 
-async function resolveCapabilitiesWithOverlay(
-  base: VideoGenerationProviderCapabilities,
-  overlay: VideoGenerationProviderCapabilities,
-): Promise<VideoGenerationProviderCapabilities> {
+const inputImages = [{ url: "https://example.com/reference.png" }];
+
+function overlayRuntime(
+  base: Capabilities,
+  overlay: Capabilities,
+  model = "model",
+  catalogByModel?: VideoGenerationProvider["catalogByModel"],
+) {
+  const dispatch = vi.fn<VideoGenerationProvider["generateVideo"]>(async () => ({
+    videos: [{ buffer: Buffer.from("mp4-bytes"), mimeType: "video/mp4" }],
+  }));
   const provider: VideoGenerationProvider = {
     id: "video-plugin",
     capabilities: base,
+    catalogByModel,
     resolveModelCapabilities: async () => overlay,
-    async generateVideo() {
-      throw new Error("should not be called");
-    },
+    generateVideo: dispatch,
   };
-  const resolved = await resolveProviderWithModelCapabilities({
-    provider,
-    providerId: "video-plugin",
-    model: "model",
-    cfg: {} as OpenClawConfig,
-    log: { debug: vi.fn() },
-  });
-  return resolved.capabilities;
+  return {
+    dispatch,
+    run: (request: Partial<GenerateVideoParams> = {}) =>
+      generateVideo(
+        {
+          cfg: { agents: { defaults: { mediaModels: { video: `video-plugin/${model}` } } } },
+          prompt: "Animate a synthetic cat",
+          ...request,
+        },
+        {
+          getProvider: (id) => (id === provider.id ? provider : undefined),
+          listProviders: () => [provider],
+          getProviderEnvVars: () => [],
+          log: { debug: vi.fn(), warn: vi.fn() },
+        },
+      ),
+  };
 }
 
-describe("video-generation capability overlays", () => {
-  it("lets explicit false and zero values narrow base capabilities", async () => {
-    const merged = await resolveCapabilitiesWithOverlay(
-      {
-        providerOptions: { seed: "number" },
-        generate: {
-          supportsAudio: true,
-          supportsWatermark: true,
-        },
-        imageToVideo: {
-          enabled: true,
-          maxInputImages: 4,
-          supportsAudio: true,
-        },
-      },
-      {
-        generate: {
-          supportsAudio: false,
-        },
-        imageToVideo: {
-          enabled: false,
-          maxInputImages: 0,
-          supportsAudio: false,
-        },
-      },
-    );
+it.each([
+  { enabled: false, maxInputImages: 4 },
+  { enabled: true, maxInputImages: 0 },
+])("rejects reference images narrowed by $enabled/$maxInputImages", async (imageToVideo) => {
+  const runtime = overlayRuntime(
+    { imageToVideo: { enabled: true, maxInputImages: 4 } },
+    { imageToVideo },
+  );
+  await expect(runtime.run({ inputImages })).rejects.toThrow(/does not support reference image/u);
+  expect(runtime.dispatch).not.toHaveBeenCalled();
+});
 
-    expect(merged.generate).toEqual({
-      supportsAudio: false,
-      supportsWatermark: true,
-    });
-    expect(merged.imageToVideo).toEqual({
-      enabled: false,
-      maxInputImages: 0,
-      supportsAudio: false,
-    });
+it("inherits omitted mode fields and merges provider option declarations", async () => {
+  const runtime = overlayRuntime(
+    {
+      providerOptions: { seed: "number" },
+      generate: { supportsAudio: true, supportsWatermark: true },
+      imageToVideo: { enabled: true, maxInputImages: 4 },
+    },
+    { providerOptions: { draft: "boolean" }, generate: {} },
+  );
+  await runtime.run({ audio: true, watermark: true, providerOptions: { seed: 42, draft: true } });
+  expect(runtime.dispatch.mock.calls[0]?.[0]).toMatchObject({
+    audio: true,
+    watermark: true,
+    providerOptions: { seed: 42, draft: true },
   });
+  await runtime.run({ inputImages });
+  expect(runtime.dispatch.mock.calls[1]?.[0].inputImages).toEqual(inputImages);
+});
 
-  it("keeps base values when overlay leaves fields undefined", async () => {
-    const merged = await resolveCapabilitiesWithOverlay(
-      {
-        providerOptions: { seed: "number" },
-        generate: {
-          supportsAudio: true,
-          supportsWatermark: true,
-        },
-        imageToVideo: {
-          enabled: true,
-          maxInputImages: 4,
-        },
-      },
-      {
-        providerOptions: { draft: "boolean" },
-        generate: {},
-      },
-    );
+it.each(["provider", "generate", "imageToVideo"] as const)("clears %s options", async (scope) => {
+  const atScope = (providerOptions: Capabilities["providerOptions"]): Capabilities =>
+    scope === "provider"
+      ? { providerOptions }
+      : scope === "generate"
+        ? { generate: { providerOptions } }
+        : { imageToVideo: { enabled: true, maxInputImages: 4, providerOptions } };
+  const runtime = overlayRuntime(
+    { providerOptions: { seed: "number" }, ...atScope({ seed: "number" }) },
+    atScope({}),
+  );
+  await expect(
+    runtime.run({
+      providerOptions: { seed: 42 },
+      ...(scope === "imageToVideo" ? { inputImages } : {}),
+    }),
+  ).rejects.toThrow(/does not accept providerOptions/u);
+  expect(runtime.dispatch).not.toHaveBeenCalled();
+});
 
-    expect(merged.providerOptions).toEqual({ seed: "number", draft: "boolean" });
-    expect(merged.generate).toEqual({
-      supportsAudio: true,
-      supportsWatermark: true,
-    });
-    expect(merged.imageToVideo).toEqual({
-      enabled: true,
-      maxInputImages: 4,
-    });
-  });
-
-  it("lets explicit empty providerOptions overlays clear inherited declarations", async () => {
-    const merged = await resolveCapabilitiesWithOverlay(
-      {
-        providerOptions: { seed: "number" },
-        generate: {
-          providerOptions: { seed: "number" },
-        },
-        imageToVideo: {
-          enabled: true,
-          maxInputImages: 4,
-          providerOptions: { seed: "number" },
-        },
-      },
-      {
-        providerOptions: {},
-        generate: {
-          providerOptions: {},
-        },
-        imageToVideo: {
-          enabled: true,
-          providerOptions: {},
-        },
-      },
-    );
-
-    expect(merged.providerOptions).toEqual({});
-    expect(merged.generate?.providerOptions).toEqual({});
-    expect(merged.imageToVideo?.providerOptions).toEqual({});
-  });
-
-  it("checks reference inputs against overlaid provider capabilities", async () => {
-    const provider: VideoGenerationProvider = {
-      id: "openrouter",
-      capabilities: {
-        imageToVideo: {
-          enabled: true,
-          maxInputImages: 4,
-        },
-      },
-      resolveModelCapabilities: async () => ({
-        imageToVideo: {
-          enabled: true,
-          maxInputImages: 1,
-        },
-      }),
-      async generateVideo() {
-        throw new Error("should not be called");
-      },
-    };
-
-    const activeProvider = await resolveProviderWithModelCapabilities({
-      provider,
-      providerId: "openrouter",
-      model: "minimax/hailuo-2.3",
-      cfg: {} as OpenClawConfig,
-      log: { debug: vi.fn() },
-    });
-
-    expect(
-      buildReferenceInputCapabilityFailure({
-        providerId: "openrouter",
-        model: "minimax/hailuo-2.3",
-        provider: activeProvider,
-        inputImageCount: 2,
-        inputVideoCount: 0,
-        inputAudioCount: 0,
-      }),
-    ).toMatch(/supports at most 1 reference image\(s\), 2 requested/);
-  });
+it.each([
+  { model: "wan2.6-t2v", supported: [true, true, false] },
+  { model: "wan2.6-i2v", supported: [false, true, false] },
+  { model: "wan2.6-r2v", supported: [false, true, true] },
+])("enforces Wan catalog modes before I/O for $model", async ({ model, supported }) => {
+  const runtime = overlayRuntime(
+    DASHSCOPE_WAN_VIDEO_CAPABILITIES,
+    DASHSCOPE_WAN_VIDEO_CATALOG_BY_MODEL[model]?.capabilities ?? {},
+    model,
+    DASHSCOPE_WAN_VIDEO_CATALOG_BY_MODEL,
+  );
+  const requests: Partial<GenerateVideoParams>[] = [
+    {},
+    { inputImages },
+    { inputVideos: [{ url: "https://example.com/reference.mp4" }] },
+  ];
+  for (const [index, request] of requests.entries()) {
+    runtime.dispatch.mockClear();
+    if (supported[index]) {
+      const result = await runtime.run(request);
+      expect(result).toMatchObject({ provider: "video-plugin", model });
+      expect(runtime.dispatch).toHaveBeenCalledOnce();
+    } else {
+      await expect(runtime.run(request)).rejects.toThrow(/does not support/u);
+      expect(runtime.dispatch).not.toHaveBeenCalled();
+    }
+  }
 });

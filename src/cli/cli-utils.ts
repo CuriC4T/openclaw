@@ -1,8 +1,11 @@
-// Shared CLI execution wrappers and inherited Commander option lookup.
 import type { Command } from "commander";
-import { formatErrorMessage } from "../infra/errors.js";
-
-export { formatErrorMessage };
+import {
+  formatCliOperatorError,
+  isExpectedCliError,
+  ReportedCliCommandError,
+} from "./failure-output.js";
+import { isJsonOutputModeActive } from "./json-output-mode.js";
+export { formatErrorMessage } from "../infra/errors.js";
 
 type ManagerLookupResult<T> = {
   manager: T | null;
@@ -32,13 +35,6 @@ export async function withManager<T>(params: {
   }
 }
 
-function formatCommandRuntimeError(err: unknown): string {
-  if (err instanceof Error) {
-    return formatErrorMessage(new Error(String(err), { cause: err.cause }));
-  }
-  return formatErrorMessage(err);
-}
-
 export async function runCommandWithRuntime(
   runtime: { error: (message: string) => void; exit: (code: number) => void },
   action: () => Promise<void>,
@@ -47,12 +43,29 @@ export async function runCommandWithRuntime(
   try {
     await action();
   } catch (err) {
-    if (onError) {
-      onError(err);
-      return;
+    // Keep help imports lazy while completed commands reach the cleanup and output-drain owner.
+    const { ExitError } = await import("../runtime.js");
+    if (err instanceof ExitError || isExpectedCliError(err)) {
+      throw err;
     }
-    runtime.error(formatCommandRuntimeError(err));
-    runtime.exit(1);
+    const jsonOutput = isJsonOutputModeActive(process.argv);
+    try {
+      if (onError) {
+        onError(err);
+      } else {
+        runtime.error(formatCliOperatorError(err));
+        if (!jsonOutput) {
+          runtime.exit(1);
+        }
+      }
+    } catch (error) {
+      if (!jsonOutput || !(error instanceof ExitError)) {
+        throw error;
+      }
+    }
+    if (jsonOutput) {
+      throw new ReportedCliCommandError(err);
+    }
   }
 }
 
@@ -67,7 +80,7 @@ export function resolveOptionFromCommand<T>(
     if (opts[key] !== undefined) {
       return opts[key];
     }
-    current = current.parent ?? undefined;
+    current = current.parent;
   }
   return undefined;
 }

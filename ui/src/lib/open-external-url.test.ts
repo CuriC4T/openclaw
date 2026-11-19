@@ -98,9 +98,7 @@ describe("openExternalUrlSafe", () => {
       .spyOn(window, "open")
       .mockImplementation(() => openedLikeProxy as unknown as Window);
 
-    const opened = openExternalUrlSafe("https://example.com/safe.png", {
-      baseHref: "https://openclaw.ai/chat",
-    });
+    const opened = openExternalUrlSafe("https://example.com/safe.png");
 
     expect(openMock).toHaveBeenCalledWith(
       "https://example.com/safe.png",
@@ -113,18 +111,38 @@ describe("openExternalUrlSafe", () => {
 });
 
 describe("reserveExternalWindowForDeferredNavigation", () => {
-  it("opens an inert placeholder and detaches its opener", () => {
-    const openedLikeProxy = {
-      opener: { postMessage: () => void 0 },
-    } as unknown as WindowProxy;
-    const openMock = vi
-      .spyOn(window, "open")
-      .mockImplementation(() => openedLikeProxy as unknown as Window);
-
-    const opened = reserveExternalWindowForDeferredNavigation();
-
-    expect(openMock).toHaveBeenCalledWith("about:blank", "_blank");
-    expect(opened).toBe(openedLikeProxy);
-    expect(openedLikeProxy.opener).toBeNull();
+  it("forwards prepared popup features and detaches the opener", () => {
+    const popup = "popup,width=520,height=720,left=480,top=130";
+    const opened = { opener: window } as unknown as WindowProxy;
+    const open = vi.spyOn(window, "open").mockReturnValue(opened);
+    expect(reserveExternalWindowForDeferredNavigation({ popup })).toBe(opened);
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank", popup);
+    expect(opened.opener).toBeNull();
   });
+
+  it("reports a blocked prepared popup without opening another window", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    expect(reserveExternalWindowForDeferredNavigation({ popup: "popup,width=520" })).toBeNull();
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, true])(
+    "opens an inert placeholder and detaches its opener (popup=%s)",
+    (popup) => {
+      const openedLikeProxy = {
+        opener: { postMessage: () => void 0 },
+      } as unknown as WindowProxy;
+      const openMock = vi
+        .spyOn(window, "open")
+        .mockImplementation(() => openedLikeProxy as unknown as Window);
+
+      const opened = reserveExternalWindowForDeferredNavigation(
+        popup === undefined ? undefined : { popup },
+      );
+
+      expect(openMock).toHaveBeenCalledWith("about:blank", "_blank", popup ? "popup" : undefined);
+      expect(opened).toBe(openedLikeProxy);
+      expect(openedLikeProxy.opener).toBeNull();
+    },
+  );
 });

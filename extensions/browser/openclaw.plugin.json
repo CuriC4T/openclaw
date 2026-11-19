@@ -1,5 +1,14 @@
 {
   "id": "browser",
+  "uiCapabilities": ["widget"],
+  "categories": ["web"],
+  "cliCommands": [
+    {
+      "name": "browser",
+      "description": "Manage OpenClaw's dedicated browser (Chrome/Chromium)",
+      "hasSubcommands": true
+    }
+  ],
   "enabledByDefault": true,
   "activation": {
     "onStartup": true,
@@ -14,5 +23,9 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {}
-  }
+  },
+  "recommendedPrompts": [
+    "Help me choose a browser profile for automation without changing my existing tabs.",
+    "Research a topic in the browser and compare sources with links."
+  ]
 }

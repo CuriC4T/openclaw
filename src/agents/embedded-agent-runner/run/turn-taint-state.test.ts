@@ -2,14 +2,16 @@ import { describe, expect, it } from "vitest";
 import { createAgentTurnTaintState } from "./turn-taint-state.js";
 
 describe("agent turn taint state", () => {
+  it("starts tainted for a restricted maintenance source turn", () => {
+    expect(createAgentTurnTaintState(true).isTainted()).toBe(true);
+  });
+
   it("becomes sticky after network content while ignoring presentation updates", () => {
     const state = createAgentTurnTaintState();
     expect(state.isTainted()).toBe(false);
 
     state.observe({
       toolName: "fake_web_tool",
-      argsHash: "args",
-      resultHash: "result",
       resultContentSource: "network",
       presentationOnly: true,
     });
@@ -17,11 +19,9 @@ describe("agent turn taint state", () => {
 
     state.observe({
       toolName: "fake_web_tool",
-      argsHash: "args",
-      resultHash: "result",
       resultContentSource: "network",
     });
-    state.observe({ toolName: "read", argsHash: "next", resultHash: "next" });
+    state.observe({ toolName: "read" });
     expect(state.isTainted()).toBe(true);
   });
 });

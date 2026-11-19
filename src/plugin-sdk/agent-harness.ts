@@ -10,12 +10,18 @@ export {
 } from "./agent-harness-runtime.js";
 export type {
   AgentHarness,
+  AgentHarnessV2,
   AgentToolResultMiddleware,
   AgentToolResultMiddlewareEvent,
   AnyAgentTool,
   EmbeddedRunAttemptParams,
+  EmbeddedRunAttemptParamsV2,
   OpenClawAgentToolResult,
 } from "./agent-harness-runtime.js";
 export { createOpenClawCodingTools } from "../agents/agent-tools.js";
+export { createOpenClawCodingToolsAsync } from "../agents/agent-tools.async.js";
 export { createCodexAppServerToolResultExtensionRunner } from "../agents/harness/codex-app-server-extensions.js";
-export { resolveWebSearchToolPolicy } from "../agents/web-search-tool-policy.js";
+export {
+  resolveWebSearchToolPolicy,
+  resolveWebSearchToolPolicyAsync,
+} from "../agents/web-search-tool-policy.js";

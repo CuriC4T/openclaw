@@ -1,38 +1,97 @@
-/** Maps cron jobs to the canonical session-store keys they are bound to. */
+/** Maps cron jobs to the physical conversations they are bound to. */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizeAgentId } from "../routing/session-key.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
+import { tryResolveCronJobEffectiveAgentId } from "./agent-id.js";
 import { resolveCronAgentSessionKey } from "./isolated-agent/session-key.js";
 import type { CronServiceContract } from "./service-contract.js";
 import { resolveCronSessionTargetSessionKey } from "./session-target.js";
-import type { CronJob } from "./types.js";
+import type { CronJob, CronStoredJob } from "./types.js";
 
-type CronJobSessionBinding = Pick<CronJob, "id" | "agentId" | "sessionKey" | "sessionTarget">;
+type CronJobSessionBinding = Pick<
+  CronStoredJob,
+  "id" | "agentId" | "sessionKey" | "sessionTarget" | "sourceConversation"
+>;
+
+type PreparedBinding = Omit<CronJobSessionBinding, "sourceConversation"> & {
+  sourceSessionKey: string | undefined;
+  defaultAgentId: string | undefined;
+  mainKey: string | undefined;
+  scope: NonNullable<OpenClawConfig["session"]>["scope"];
+  bindings: ReadonlyMap<string, string>;
+};
+const preparedBindings = new WeakMap<CronJobSessionBinding, PreparedBinding[]>();
 
 /**
- * Resolves every canonical session key a job is bound to: the session the run
+ * Maps each canonical session key to its owning agent: the session the run
  * joins (main/isolated/session:<key>) plus the explicit wake/delivery lane in
- * job.sessionKey. Keys use the same canonicalization as cron run/session
- * creation, so they compare equal to gateway session-store row keys.
+ * job.sessionKey and the creating conversation. Keys compare equal to physical
+ * Gateway session-store rows; values retain ownership when the key is unqualified.
  */
-export function resolveCronJobBoundSessionKeys(
+export function resolveCronJobSessionBindings(
   job: CronJobSessionBinding,
   opts: { cfg: OpenClawConfig; defaultAgentId?: string },
-): Set<string> {
-  const agentId = normalizeAgentId(job.agentId ?? opts.defaultAgentId);
-  const keys = new Set<string>();
+): ReadonlyMap<string, string> {
+  const mainKey = opts.cfg.session?.mainKey;
+  const scope = opts.cfg.session?.scope;
+  const sourceSessionKey = job.sourceConversation?.sessionKey;
+  const prepared = preparedBindings.get(job);
+  // These scalar facts are the binding revision, including in-place edits.
+  // Keep separate bounded slots for interleaved callers with different routing.
+  for (const entry of prepared ?? []) {
+    if (
+      entry.id === job.id &&
+      entry.agentId === job.agentId &&
+      entry.sessionKey === job.sessionKey &&
+      entry.sessionTarget === job.sessionTarget &&
+      entry.sourceSessionKey === sourceSessionKey &&
+      entry.defaultAgentId === opts.defaultAgentId &&
+      entry.mainKey === mainKey &&
+      entry.scope === scope
+    ) {
+      return entry.bindings;
+    }
+  }
+  const bindings = new Map<string, string>();
+  const entry: PreparedBinding = {
+    id: job.id,
+    agentId: job.agentId,
+    sessionKey: job.sessionKey,
+    sessionTarget: job.sessionTarget,
+    sourceSessionKey,
+    defaultAgentId: opts.defaultAgentId,
+    mainKey,
+    scope,
+    bindings,
+  };
+  if (prepared) {
+    if (prepared.length === 4) {
+      prepared.shift();
+    }
+    prepared.push(entry);
+  } else {
+    preparedBindings.set(job, [entry]);
+  }
+  const agentId = tryResolveCronJobEffectiveAgentId(job, opts.defaultAgentId);
+  if (!agentId) {
+    return bindings;
+  }
   const add = (sessionKey: string | undefined) => {
     const trimmed = sessionKey?.trim();
     if (!trimmed) {
       return;
     }
-    keys.add(
-      resolveCronAgentSessionKey({
-        sessionKey: trimmed,
-        agentId,
-        mainKey: opts.cfg.session?.mainKey,
-        cfg: opts.cfg,
-      }),
-    );
+    // Literal global names the selected agent's physical row; a qualified
+    // named target remains distinct. Queue-key qualification has other owners.
+    const key =
+      scope === "global" && trimmed === "global"
+        ? trimmed
+        : resolveCronAgentSessionKey({
+            sessionKey: trimmed,
+            agentId,
+            mainKey,
+            cfg: opts.cfg,
+          });
+    bindings.set(key, parseAgentSessionKey(key)?.agentId ?? agentId);
   };
   try {
     if (job.sessionTarget === "main") {
@@ -47,12 +106,13 @@ export function resolveCronJobBoundSessionKeys(
       add(resolveCronSessionTargetSessionKey(job.sessionTarget));
     }
     add(job.sessionKey);
+    add(job.sourceConversation?.sessionKey);
   } catch {
     // Malformed persisted targets are quarantined by the store loader; a job
     // that slips through must not break session listing, so bind nothing.
-    keys.clear();
+    bindings.clear();
   }
-  return keys;
+  return bindings;
 }
 
 /** Signals a locked re-check found the job no longer bound; a per-job no-op. */
@@ -62,37 +122,49 @@ class CronJobBindingStaleError extends Error {
   }
 }
 
-/**
- * Disables every enabled cron job bound to a session, used when the session is
- * archived so schedules stop targeting a lane that rejects new work.
- * Returns the disabled job ids.
- */
-export async function disableCronJobsBoundToSession(params: {
+/** Disables enabled jobs bound to any archived session with one job-list scan. */
+export async function disableCronJobsBoundToSessions(params: {
   cron: Pick<CronServiceContract, "list" | "updateWithPrecondition" | "getDefaultAgentId">;
   cfg: OpenClawConfig;
-  sessionKey: string;
-}): Promise<string[]> {
+  sessionKeys: readonly string[];
+}): Promise<Map<string, string[]>> {
+  const sessionKeys = [...new Set(params.sessionKeys.map((key) => key.trim()).filter(Boolean))];
+  const disabledBySession = new Map(sessionKeys.map((sessionKey) => [sessionKey, [] as string[]]));
+  if (sessionKeys.length === 0) {
+    return disabledBySession;
+  }
+  const targetKeys = new Set(sessionKeys);
   const jobs = await params.cron.list();
   const defaultAgentId = params.cron.getDefaultAgentId();
-  const boundToSession = (job: CronJobSessionBinding & Pick<CronJob, "enabled">) =>
-    job.enabled &&
-    resolveCronJobBoundSessionKeys(job, { cfg: params.cfg, defaultAgentId }).has(params.sessionKey);
-  const disabled: string[] = [];
+  const matchingSessionKeys = (job: CronJobSessionBinding & Pick<CronJob, "enabled">) => {
+    if (!job.enabled) {
+      return [];
+    }
+    const boundKeys = resolveCronJobSessionBindings(job, {
+      cfg: params.cfg,
+      defaultAgentId,
+    });
+    return [...boundKeys.keys()].filter((sessionKey) => targetKeys.has(sessionKey));
+  };
   const failures: unknown[] = [];
   for (const job of jobs) {
-    if (!boundToSession(job)) {
+    if (matchingSessionKeys(job).length === 0) {
       continue;
     }
     try {
       // Re-check the binding under the store lock: a job retargeted after the
       // list snapshot must not be disabled, and one failing/removed job must
       // not abort the remaining bound jobs.
+      let lockedMatches: string[] = [];
       await params.cron.updateWithPrecondition(job.id, { enabled: false }, (currentJob) => {
-        if (!boundToSession(currentJob)) {
+        lockedMatches = matchingSessionKeys(currentJob);
+        if (lockedMatches.length === 0) {
           throw new CronJobBindingStaleError();
         }
       });
-      disabled.push(job.id);
+      for (const sessionKey of lockedMatches) {
+        disabledBySession.get(sessionKey)?.push(job.id);
+      }
     } catch (error) {
       if (error instanceof CronJobBindingStaleError) {
         continue;
@@ -101,10 +173,14 @@ export async function disableCronJobsBoundToSession(params: {
     }
   }
   if (failures.length > 0) {
+    const subject =
+      sessionKeys.length === 1
+        ? `bound to ${sessionKeys[0]}`
+        : `bound to ${sessionKeys.length} archived sessions`;
     throw new AggregateError(
       failures,
-      `failed to disable ${failures.length} cron job(s) bound to ${params.sessionKey}`,
+      `failed to disable ${failures.length} cron job(s) ${subject}`,
     );
   }
-  return disabled;
+  return disabledBySession;
 }

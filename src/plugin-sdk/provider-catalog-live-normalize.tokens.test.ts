@@ -1,5 +1,6 @@
 // Plugin SDK tests cover vendor token-limit field mapping in live discovery.
 import { describe, expect, it } from "vitest";
+import { model as makeCatalogModel } from "../agents/model-catalog-fixtures.test-support.js";
 import { buildOpenAICompatibleLiveModels } from "./provider-catalog-live-normalize.internal.js";
 import type { ModelProviderConfig } from "./provider-model-shared.js";
 
@@ -11,11 +12,26 @@ const fallback = {
 } as unknown as ModelProviderConfig;
 
 function firstModel(row: Record<string, unknown>) {
-  const [model] = buildOpenAICompatibleLiveModels([{ object: "model", ...row }], fallback);
+  const [model] = buildOpenAICompatibleLiveModels(
+    [{ object: "model", capabilities: { chat: true }, ...row }],
+    fallback,
+  );
   return model;
 }
 
 describe("live discovery vendor token-limit fields", () => {
+  it("fills an omitted seed window from the matching live row", () => {
+    const [model] = buildOpenAICompatibleLiveModels(
+      [{ id: "transport-only", object: "model", context_window: 262_144 }],
+      {
+        ...fallback,
+        models: [makeCatalogModel("transport-only", "Transport only", { maxTokens: 8192 })],
+      },
+    );
+
+    expect(model?.contextWindow).toBe(262_144);
+  });
+
   it("reads Anthropic's max_input_tokens and max_tokens", () => {
     // Anthropic names the context window by its input side and the output cap
     // as max_tokens; before this mapping both fell back to generic defaults.
@@ -49,9 +65,15 @@ describe("live discovery vendor token-limit fields", () => {
     expect(model?.maxTokens).toBe(32_000);
   });
 
-  it("keeps the previous defaults when a row advertises no limits", () => {
+  it("uses the shared output default when a row advertises no limits", () => {
     const model = firstModel({ id: "bare-model" });
     expect(model?.contextWindow).toBe(128_000);
-    expect(model?.maxTokens).toBe(8192);
+    expect(model?.maxTokens).toBe(32_768);
+  });
+
+  it("keeps half of a small advertised window for input", () => {
+    const model = firstModel({ id: "small-model", context_length: 32_768 });
+    expect(model?.contextWindow).toBe(32_768);
+    expect(model?.maxTokens).toBe(16_384);
   });
 });

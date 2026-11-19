@@ -1,144 +1,270 @@
-// Deepgram tests cover realtime transcription provider plugin behavior.
-import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type WebSocket from "ws";
-import { WebSocketServer } from "ws";
-import { buildDeepgramRealtimeTranscriptionProvider } from "./realtime-transcription-provider.js";
+import { createRealtimeTranscriptionWebSocketSession } from "openclaw/plugin-sdk/realtime-transcription-session";
+import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
+import { afterEach, expect, it, vi } from "vitest";
+import type { WebSocket } from "ws";
+import { buildDeepgramRealtimeTranscriptionProvider } from "./realtime-transcription-provider-factory.js";
+import { createSocketServer } from "./websocket.test-support.js";
 
-let cleanup: (() => Promise<void>) | undefined;
+// The saved-key store is fixture-owned; no test reads real credentials.
+const savedKey = vi.fn<(lookup: object) => Promise<string | undefined>>();
+const provider = buildDeepgramRealtimeTranscriptionProvider({
+  createRealtimeTranscriptionWebSocketSession,
+  isProviderAuthProfileConfiguredAsync: async (lookup) => (await savedKey(lookup)) !== undefined,
+  resolveProviderAuthProfileApiKey: savedKey,
+});
+const savedKeyLookup = { provider: "deepgram", cfg: {}, profileTypes: ["api_key"] };
 
-async function createDeepgramRealtimeServer(params: {
-  onRequest: (url: URL, headers: Record<string, string | string[] | undefined>) => void;
-}) {
-  const server = createServer();
-  const wss = new WebSocketServer({ noServer: true });
-  const clients = new Set<WebSocket>();
-
-  server.on("upgrade", (request, socket, head) => {
-    params.onRequest(new URL(request.url ?? "/", "http://127.0.0.1"), request.headers);
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      clients.add(ws);
-      ws.on("close", () => clients.delete(ws));
-    });
-  });
-
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  const port = (server.address() as AddressInfo).port;
-  cleanup = async () => {
-    for (const ws of clients) {
-      ws.terminate();
-    }
-    await new Promise<void>((resolve) => {
-      wss.close(() => resolve());
-    });
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+async function createScenario(onConnection: (ws: WebSocket) => void, endpointingMs?: number) {
+  const { baseUrl, requests } = await createSocketServer(onConnection, "/deepgram/v1");
+  const callbacks = {
+    onPartial: vi.fn(),
+    onTranscript: vi.fn(),
+    onSpeechStart: vi.fn(),
+    onError: vi.fn<(error: Error) => void>(),
   };
-  return { baseUrl: `http://127.0.0.1:${port}/deepgram/v1` };
+  const session = provider.createSession({
+    providerConfig: { apiKey: "dummy", baseUrl, endpointingMs },
+    ...callbacks,
+  });
+  try {
+    await session.connect();
+  } catch (error) {
+    session.close();
+    throw error;
+  }
+  return {
+    ...callbacks,
+    session,
+    requests,
+    [Symbol.dispose]: () => session.close(),
+    waitForDelivery: () =>
+      vi.waitFor(() =>
+        expect(callbacks.onError).toHaveBeenCalledExactlyOnceWith(new Error("frames delivered")),
+      ),
+  };
 }
 
-describe("buildDeepgramRealtimeTranscriptionProvider", () => {
-  afterEach(async () => {
-    await cleanup?.();
-    cleanup = undefined;
-    vi.unstubAllEnvs();
-  });
+type Result = [text: string, final?: boolean, speechFinal?: boolean, fromFinalize?: boolean];
+type Frame = Result | "SpeechStarted" | "UtteranceEnd" | "StaleUtteranceEnd";
+function sendResult(ws: WebSocket, [text, final = false, end = false, flush = false]: Result) {
+  ws.send(
+    JSON.stringify({
+      type: "Results",
+      channel: { alternatives: [{ transcript: text }] },
+      is_final: final,
+      speech_final: end,
+      from_finalize: flush,
+    }),
+  );
+}
 
-  it("normalizes nested provider config", () => {
-    const provider = buildDeepgramRealtimeTranscriptionProvider();
-    const resolved = provider.resolveConfig?.({
+afterEach(async () => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  savedKey.mockReset();
+});
+
+it("normalizes nested config and connects through an explicit HTTP base URL", async () => {
+  const { baseUrl, requests } = await createSocketServer(() => {}, "/deepgram/v1");
+  const deepgram = {
+    apiKey: "dg-key",
+    baseUrl,
+    model: "nova-3",
+    language: "en-US",
+    encoding: "g711_ulaw",
+    sample_rate: "8000",
+    interim_results: "true",
+    endpointing: "500",
+  };
+  const providerConfig =
+    provider.resolveConfig?.({
       cfg: {} as OpenClawConfig,
-      rawConfig: {
-        providers: {
-          deepgram: {
-            apiKey: "dg-key",
-            model: "nova-3",
-            encoding: "g711_ulaw",
-            sample_rate: "8000",
-            interim_results: "true",
-            endpointing: "500",
-            language: "en-US",
-          },
-        },
-      },
-    });
+      rawConfig: { providers: { deepgram } },
+    }) ?? {};
+  const session = provider.createSession({ providerConfig });
+  await session.connect();
+  session.close();
+  const { url, headers } = requests[0]!;
+  expect(url.pathname).toBe("/deepgram/v1/listen");
+  expect(url.searchParams.toString()).toBe(
+    "model=nova-3&encoding=mulaw&sample_rate=8000&channels=1&interim_results=true&endpointing=500&utterance_end_ms=1000&language=en-US",
+  );
+  expect(headers.authorization).toBe("Token dg-key");
+});
 
-    expect(resolved).toEqual({
-      apiKey: "dg-key",
-      baseUrl: undefined,
-      model: "nova-3",
-      language: "en-US",
-      sampleRate: 8000,
-      encoding: "mulaw",
-      interimResults: true,
-      endpointingMs: 500,
-    });
-  });
+it.each([
+  ["a key saved for Deepgram", {}, "", "Token saved-key"],
+  ["the Voice Call key before a saved one", { apiKey: "config-key" }, "", "Token config-key"],
+  ["DEEPGRAM_API_KEY before a saved one", {}, "env-key", "Token env-key"],
+])("connects with %s", async (_name, keyConfig, envKey, authorization) => {
+  vi.stubEnv("DEEPGRAM_API_KEY", envKey);
+  savedKey.mockResolvedValue("saved-key");
+  const { baseUrl, requests } = await createSocketServer(() => {}, "/deepgram/v1");
+  const providerConfig = { ...keyConfig, baseUrl };
+  // Unnamed, as a candidate of automatic selection, the saved key does not count.
+  expect(await provider.isConfiguredAsync?.({ cfg: {}, providerConfig })).toBe(
+    authorization !== "Token saved-key",
+  );
+  expect(
+    await provider.isConfiguredAsync?.({ cfg: {}, providerConfig, selectedExplicitly: true }),
+  ).toBe(true);
+  const session = provider.createSession({ cfg: {}, providerConfig });
+  await session.connect();
+  session.close();
+  expect(requests[0]?.headers.authorization).toBe(authorization);
+  // Only a provider with no other key asks the store, and only for its own API key.
+  expect(savedKey.mock.calls).toEqual(
+    authorization === "Token saved-key" ? [[savedKeyLookup], [savedKeyLookup]] : [],
+  );
+});
 
-  it("requires an API key when creating sessions", () => {
-    vi.stubEnv("DEEPGRAM_API_KEY", "");
-    const provider = buildDeepgramRealtimeTranscriptionProvider();
-    expect(() => provider.createSession({ providerConfig: {} })).toThrow(
-      "Deepgram API key missing",
-    );
-  });
+it("reports a missing key when connecting", async () => {
+  vi.stubEnv("DEEPGRAM_API_KEY", "");
+  expect(await provider.isConfiguredAsync?.({ cfg: {}, providerConfig: {} })).toBe(false);
+  const session = provider.createSession({ providerConfig: {} });
+  await expect(session.connect()).rejects.toThrow(/^Deepgram API key missing$/);
+  session.close();
+});
 
-  it.each(["not a url", "ftp://files.example.com"])("rejects invalid endpoint %s", (baseUrl) => {
-    const provider = buildDeepgramRealtimeTranscriptionProvider();
-    expect(() => provider.createSession({ providerConfig: { apiKey: "dg-key", baseUrl } })).toThrow(
-      /^Invalid Deepgram baseUrl:/,
-    );
-  });
+const privateUrlConfig = { apiKey: "key", baseUrl: "ftp://host/secret" };
+it.each([
+  ["BASE_URL", "!", { apiKey: "key" }, /^Invalid Deepgram baseUrl: value is not a valid URL$/],
+  ["BASE_URL", "", privateUrlConfig, /^(?!.*secret)Invalid Deepgram baseUrl: unsupported scheme/],
+] as const)("validates DEEPGRAM_%s=%s", (env, value, providerConfig, error) => {
+  vi.stubEnv(`DEEPGRAM_${env}`, value);
+  expect(() => provider.createSession({ providerConfig })).toThrow(error);
+});
 
-  it("validates the environment override", () => {
-    vi.stubEnv("DEEPGRAM_BASE_URL", "not a url");
-    const provider = buildDeepgramRealtimeTranscriptionProvider();
-    expect(() => provider.createSession({ providerConfig: { apiKey: "dg-key" } })).toThrow(
-      "Invalid Deepgram baseUrl: value is not a valid URL",
-    );
-  });
-
-  it("does not echo the configured URL in validation errors", () => {
-    const rawMarker = "configured-value-marker";
-    const nonHttp = `ftp://files.example.com/${rawMarker}`;
-    const provider = buildDeepgramRealtimeTranscriptionProvider();
-    try {
-      provider.createSession({ providerConfig: { apiKey: "dg-key", baseUrl: nonHttp } });
-      throw new Error("expected rejection");
-    } catch (error) {
-      const message = (error as Error).message;
-      expect(message).toMatch(/unsupported scheme/);
-      expect(message).not.toContain(rawMarker);
+const yes: Result = ["yes", true, true];
+const turns: [string, Frame[], string[], string[], number][] = [
+  [
+    "rejects tails",
+    [["partial"], "UtteranceEnd", ["", true, true], "SpeechStarted"],
+    ["partial"],
+    [],
+    2,
+  ],
+  ["repeats", [yes, yes], [], ["yes", "yes"], 2],
+  ["ends a stalled turn without speech_final", [["a", true], "UtteranceEnd"], ["a"], ["a"], 1],
+  ["does not duplicate an ended turn", [yes, "UtteranceEnd", ["", true, true]], [], ["yes"], 1],
+  ["ignores stale gaps", [["a", true], "StaleUtteranceEnd", ["b", true, true]], ["a"], ["a b"], 1],
+];
+it.each(turns)("%s", async (_name, frames, partials, transcripts, starts) => {
+  using scenario = await createScenario((ws) => {
+    for (const frame of frames) {
+      if (typeof frame === "string") {
+        ws.send(
+          JSON.stringify({
+            type: frame === "StaleUtteranceEnd" ? "UtteranceEnd" : frame,
+            last_word_end: frame === "StaleUtteranceEnd" ? -1 : 1,
+          }),
+        );
+      } else {
+        sendResult(ws, frame);
+      }
     }
+    ws.send(JSON.stringify({ type: "Error", message: "frames delivered" }));
   });
+  await scenario.waitForDelivery();
+  scenario.session.close();
+  expect(scenario.onPartial.mock.calls.flat()).toEqual(partials);
+  expect(scenario.onTranscript.mock.calls.flat()).toEqual(transcripts);
+  expect(scenario.onSpeechStart).toHaveBeenCalledTimes(starts);
+  expect(scenario.requests[0]?.url.searchParams.get("endpointing")).toBe("800");
+  expect(scenario.requests[0]?.url.searchParams.get("utterance_end_ms")).toBe("1000");
+  expect(scenario.requests[0]?.url.searchParams.get("model")).toBe("nova-3");
+});
 
-  it("connects through an explicit HTTP base URL over loopback WebSocket", async () => {
-    const requests: Array<{
-      url: URL;
-      headers: Record<string, string | string[] | undefined>;
-    }> = [];
-    const server = await createDeepgramRealtimeServer({
-      onRequest: (url, headers) => requests.push({ url, headers }),
+it.each([true, false])("finalizes once with provider reply=%s", async (reply) => {
+  const onFinalize = vi.fn();
+  using scenario = await createScenario((ws) => {
+    sendResult(ws, ["good", true]);
+    sendResult(ws, ["bye"]);
+    ws.on("message", (data) => {
+      const message: { type?: string } = JSON.parse(rawDataToString(data, "utf8"));
+      if (message.type !== "Finalize") {
+        return;
+      }
+      onFinalize();
+      if (reply) {
+        sendResult(ws, ["bye", true, false, true]);
+      }
     });
-    const provider = buildDeepgramRealtimeTranscriptionProvider();
-    const session = provider.createSession({
-      providerConfig: {
-        apiKey: "dummy",
-        baseUrl: server.baseUrl,
-      },
-    });
+  }, 10_000);
+  try {
+    await vi.waitFor(() => expect(scenario.onPartial).toHaveBeenCalledWith("good bye"));
+    vi.useFakeTimers();
+    scenario.session.close();
+    scenario.session.close();
+    await (reply
+      ? vi.waitFor(() => expect(scenario.onTranscript).toHaveBeenCalledExactlyOnceWith("good bye"))
+      : vi.advanceTimersByTimeAsync(5_000));
+    expect(scenario.onTranscript).toHaveBeenCalledExactlyOnceWith(reply ? "good bye" : "good");
+    expect(onFinalize).toHaveBeenCalledTimes(1);
+  } finally {
+    // Failed delivery observations still close with a bounded fallback clock.
+    vi.useFakeTimers();
+    scenario.session.close();
+    await vi.advanceTimersByTimeAsync(5_000);
+  }
+});
 
-    await session.connect();
-    session.close();
+it("does not infer silence from a gap between provisional results", async () => {
+  vi.useFakeTimers();
+  let socket: WebSocket | undefined;
+  using scenario = await createScenario((ws) => {
+    socket = ws;
+    sendResult(ws, ["still speaking"]);
+  }, 25);
+  const { session, onPartial, onTranscript } = scenario;
+  await vi.waitFor(() => expect(onPartial).toHaveBeenCalledWith("still speaking"));
+  await vi.advanceTimersByTimeAsync(350);
+  expect(onTranscript).not.toHaveBeenCalled();
+  sendResult(socket!, ["continuous speech", true, true]);
+  await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledWith("continuous speech"));
+  session.close();
+  expect(onTranscript).toHaveBeenCalledTimes(1);
+});
 
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.url.pathname).toBe("/deepgram/v1/listen");
-    expect(requests[0]?.url.searchParams.get("model")).toBe("nova-3");
-    expect(requests[0]?.headers.authorization).toBe("Token dummy");
+it.each([
+  { name: "discards provisional speech", isFinal: false, expected: [["new"]] },
+  {
+    name: "preserves finalized speech as a separate turn",
+    isFinal: true,
+    expected: [["old"], ["new"]],
+  },
+])("$name when the provider reconnects", async ({ isFinal, expected }) => {
+  vi.useFakeTimers();
+  let connectionCount = 0;
+  using scenario = await createScenario((ws) => {
+    connectionCount += 1;
+    if (connectionCount === 1) {
+      sendResult(ws, ["old", isFinal]);
+      ws.close();
+      return;
+    }
+    sendResult(ws, ["new", true, true]);
+  }, 10_000);
+  const { session, onTranscript } = scenario;
+  // Observe the real socket close before advancing the provider's retry delay.
+  await vi.waitFor(() => expect(session.isConnected()).toBe(false));
+  await vi.advanceTimersByTimeAsync(1000);
+  await vi.waitFor(() => expect(onTranscript).toHaveBeenCalledTimes(expected.length), {
+    timeout: 3000,
   });
+  session.close();
+  expect(onTranscript.mock.calls).toEqual(expected);
+});
+
+it("terminates instead of retaining an oversized utterance", async () => {
+  using scenario = await createScenario((ws) => {
+    sendResult(ws, ["x".repeat(256 * 1024), true]);
+    sendResult(ws, ["y"]);
+  });
+  const { session, onError } = scenario;
+  await vi.waitFor(() =>
+    expect(onError.mock.calls[0]?.[0].message).toContain("retained transcript exceeded"),
+  );
+  expect(session.isConnected()).toBe(false);
 });

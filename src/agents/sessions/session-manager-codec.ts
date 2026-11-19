@@ -1,18 +1,189 @@
-import { selectSessionTranscriptLeafControlledPath } from "../../config/sessions/transcript-tree.js";
-import { CURRENT_SESSION_VERSION } from "../../config/sessions/version.js";
-import { logWarn } from "../../logger.js";
+import { isProxy } from "node:util/types";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { buildSessionContext as buildCoreSessionContext } from "../../../packages/agent-core/src/harness/session/session.js";
+import { stripCompactionReplayCheckpointInPlace } from "../../../packages/ai/src/transports/provider-compaction-checkpoint.js";
+import { bindCacheTtlProjectionPrefixes } from "../../config/sessions/session-cache-ttl-prefix.js";
 import {
-  buildSessionContext as buildCoreSessionContext,
-  type SessionTreeEntry as CoreSessionTreeEntry,
-} from "../runtime/index.js";
+  isIndexedSessionEntry,
+  partitionSessionFileEntries,
+} from "../../config/sessions/session-entry-codec.js";
+import { isOwnedTranscriptPayload } from "../../config/sessions/transcript-json.js";
+import { cloneTranscriptView } from "../../config/sessions/transcript-snapshot.js";
+import { selectSessionTranscriptLeafControlledPath } from "../../config/sessions/transcript-tree.js";
+import { MIN_READABLE_SESSION_VERSION } from "../../config/sessions/version.js";
+import { freezeJsonSnapshot } from "../../shared/immutable-data.js";
+import { projectModelContextMessages } from "../../shared/model-context-message.js";
+import { isOpenClawSubagentCompletionMirrorAssistantMessage } from "../../shared/transcript-only-openclaw-assistant.js";
+import type { SessionTreeEntry as CoreSessionTreeEntry } from "../runtime/index.js";
 import { generateSessionEntryId } from "./session-manager-id.js";
 import type {
   CompactionEntry,
   FileEntry,
   SessionContext,
   SessionEntry,
-  SessionHeader,
+  PreservedOpaqueFileEntry,
+  SessionTreeNode,
 } from "./session-manager-types.js";
+import type { SessionManagerBoundedView } from "./session-manager-view-types.js";
+import { shareSessionSystemPrompt } from "./system-prompt-pool.js";
+
+export {
+  classifySessionFileEntry,
+  isIndexedSessionEntry,
+  parseOpaqueLeafEntry,
+  parseParentLinkedOpaqueEntry,
+} from "../../config/sessions/session-entry-codec.js";
+
+/** Hydrated entries own envelopes; writable SDK exposure detaches their shared payloads once. */
+export function prepareSessionManagerEntries(entries: readonly unknown[]) {
+  const partitioned = partitionSessionFileEntries(entries);
+  const ownerSealed = isOwnedTranscriptPayload(entries);
+  const pendingWritableTranscriptEntries = new Set<object>();
+  // Probe the root once: JavaScriptCore scans every index of an array on each
+  // Object.isFrozen call, so a per-entry probe is quadratic in history length.
+  const entriesFrozen = Object.isFrozen(entries);
+  const ownEnvelope = <T>(entry: T, shared = entriesFrozen || Object.isFrozen(entry)): T => {
+    if (!entry || typeof entry !== "object" || !shared) {
+      return entry;
+    }
+    const container: object = Array.isArray(entry) ? entry.slice() : {};
+    // Hydration's sealed root outlives the generic freezer's rotating memo.
+    const envelope = Object.assign(container, ownerSealed ? entry : freezeJsonSnapshot(entry));
+    pendingWritableTranscriptEntries.add(envelope);
+    return envelope;
+  };
+  let fileIndex = 0;
+  for (const [index, entry] of partitioned.fileEntriesByOriginalIndex.entries()) {
+    if (entry) {
+      const envelope = ownEnvelope(
+        shareSessionSystemPrompt(entry),
+        entriesFrozen || Object.isFrozen(entry),
+      );
+      partitioned.fileEntries[fileIndex++] = envelope;
+      partitioned.fileEntriesByOriginalIndex[index] = envelope;
+    }
+  }
+  if (
+    (partitioned.fileEntries.find((entry) => entry.type === "session")?.version ?? 1) <
+    MIN_READABLE_SESSION_VERSION
+  ) {
+    ownSessionTranscriptEntries(partitioned.fileEntries, pendingWritableTranscriptEntries);
+  }
+  for (const entry of partitioned.opaqueEntries) {
+    entry.record = ownEnvelope(entry.record);
+  }
+  return { ...partitioned, pendingWritableTranscriptEntries };
+}
+
+export function ownSessionTranscriptEntries(
+  entries: readonly unknown[],
+  pending: Set<object>,
+): boolean {
+  let detached = false;
+  for (const entry of entries) {
+    if (entry && typeof entry === "object" && pending.has(entry)) {
+      Object.assign(entry, cloneTranscriptView(entry, { shareImmutablePayloads: false }));
+      pending.delete(entry);
+      detached = true;
+    }
+  }
+  return detached;
+}
+
+export function prepareSessionManagerBoundedIndexes(
+  bounded: SessionManagerBoundedView,
+  entriesByOriginalIndex: readonly (FileEntry | undefined)[],
+  readBranch: () => readonly SessionEntry[],
+  byId: ReadonlyMap<string, SessionEntry>,
+) {
+  const boundedFirstKeptById = new Map<string, string>();
+  for (const [boundaryId, range] of bounded.firstKeptRanges) {
+    // An empty retained slice starts at its boundary; opaque rows are not model cut points.
+    let firstKeptEntryId = boundaryId;
+    for (let index = range.startIndex; index < range.endIndex; index++) {
+      const entry = entriesByOriginalIndex[index];
+      if (isIndexedSessionEntry(entry)) {
+        firstKeptEntryId = entry.id;
+        break;
+      }
+    }
+    boundedFirstKeptById.set(boundaryId, firstKeptEntryId);
+  }
+  const cacheTtlProjectionPrefixes = bindCacheTtlProjectionPrefixes(bounded, {
+    getBranch: readBranch,
+    getEntry: (id) => byId.get(id),
+  });
+  return { boundedFirstKeptById, cacheTtlProjectionPrefixes };
+}
+
+export function interleaveSessionFileEntries(
+  fileEntries: FileEntry[],
+  opaqueEntries: PreservedOpaqueFileEntry[],
+): unknown[] {
+  const entries: unknown[] = [];
+  let opaqueIndex = 0;
+  for (let index = 0; index <= fileEntries.length; index++) {
+    while (opaqueEntries[opaqueIndex]?.index === index) {
+      entries.push(opaqueEntries[opaqueIndex++]?.record);
+    }
+    if (fileEntries[index]) {
+      entries.push(fileEntries[index]);
+    }
+  }
+  while (opaqueIndex < opaqueEntries.length) {
+    entries.push(opaqueEntries[opaqueIndex++]?.record);
+  }
+  return entries;
+}
+
+export function clampOpaqueSessionEntryIndexes(
+  entries: PreservedOpaqueFileEntry[],
+  length: number,
+): void {
+  let previous = 0;
+  for (const entry of entries) {
+    entry.index = Math.max(previous, Math.min(entry.index, length));
+    previous = entry.index;
+  }
+}
+
+export function collectSessionEntryChildren(
+  entries: Iterable<SessionEntry>,
+  parentId: string,
+  normalize: (entry: SessionEntry) => SessionEntry,
+): SessionEntry[] {
+  const children: SessionEntry[] = [];
+  for (const entry of entries) {
+    const normalized = normalize(entry);
+    if (normalized.parentId === parentId) {
+      children.push(normalized);
+    }
+  }
+  return children;
+}
+
+/** Rows that record history without consuming the open turn's keyed input. */
+export function isOutOfTurnHistoryEntry(entry: SessionEntry): boolean {
+  return (
+    isTalkRealtimeVoiceEntry(entry) ||
+    (entry.type === "message" && isOpenClawSubagentCompletionMirrorAssistantMessage(entry.message))
+  );
+}
+
+function isTalkRealtimeVoiceEntry(entry: SessionEntry): boolean {
+  if (
+    entry.type !== "message" ||
+    (entry.message.role !== "user" && entry.message.role !== "assistant")
+  ) {
+    return false;
+  }
+  const provenance: unknown = Reflect.get(entry.message, "provenance");
+  return (
+    isRecord(provenance) &&
+    provenance.kind === "realtime_voice" &&
+    provenance.sourceChannel === "talk"
+  );
+}
 
 export function isSessionContextMetadataEntry(entry: SessionEntry): boolean {
   return (
@@ -76,16 +247,11 @@ export function migrateToCurrentVersion(
 ): boolean {
   const header = entries.find((entry) => entry.type === "session");
   const version = header?.version ?? 1;
-  if (version >= CURRENT_SESSION_VERSION) {
+  if (version >= MIN_READABLE_SESSION_VERSION) {
     return false;
   }
-  const ids = new Set<string>();
   const state: SessionFileEntryMigrationState = {
-    createEntryId: () => {
-      const id = generateSessionEntryId(ids);
-      ids.add(id);
-      return id;
-    },
+    createEntryId: generateSessionEntryId,
     previousId: null,
     resolveOriginalEntryId: (originalIndex) => {
       const targetEntry = entriesByOriginalIndex
@@ -105,20 +271,79 @@ export function migrateSessionEntries(entries: FileEntry[]): void {
   migrateToCurrentVersion(entries);
 }
 
-export function parseSessionEntries(content: string): FileEntry[] {
-  return parseJsonlEntries(content);
+export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
+  const boundary = entries.findLast(
+    (entry) => entry.type === "reset" || entry.type === "compaction",
+  );
+  return boundary?.type === "compaction" ? boundary : null;
 }
 
-export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
-  for (const entry of entries.toReversed()) {
-    if (entry.type === "reset") {
-      return null;
-    }
-    if (entry.type === "compaction") {
-      return entry;
+/** Data projection only; an exclusive preparation worker does not publish a shared snapshot. */
+export function projectSessionModelContextData(branch: readonly SessionEntry[]): SessionEntry[] {
+  const events = [...branch];
+  for (let index = 0; index < events.length; index++) {
+    const entry = events[index]!;
+    if (entry.type === "message") {
+      const message = projectModelContextMessages([entry.message])[0]!;
+      if (message !== entry.message) {
+        events[index] = { ...entry, message };
+      }
     }
   }
-  return null;
+  return events;
+}
+
+export function projectSessionModelContextEntries(branch: readonly SessionEntry[]): SessionEntry[] {
+  // Stored snapshots stay shared; mutable SDK edits detach before internal publication.
+  return cloneTranscriptView(projectSessionModelContextData(branch), { freeze: true });
+}
+
+/** Reuse immutable text without sharing the freshly hydrated message containers. */
+export function reuseResidentSessionEntryStrings(
+  entries: readonly FileEntry[],
+  residentEntries: ReadonlyMap<string, SessionEntry>,
+): void {
+  const reuse = (target: object, source: unknown): void => {
+    if (target === source || source === null || typeof source !== "object" || isProxy(source)) {
+      return;
+    }
+    for (const key of Object.keys(target)) {
+      const value: unknown = Reflect.get(target, key);
+      if (typeof value !== "string" && (value === null || typeof value !== "object")) {
+        continue;
+      }
+      const resident: unknown = Object.getOwnPropertyDescriptor(source, key)?.value;
+      if (typeof value === "string" && value === resident) {
+        Reflect.set(target, key, resident);
+      } else if (value !== null && typeof value === "object") {
+        reuse(value, resident);
+      }
+    }
+  };
+  for (const entry of entries) {
+    const resident = entry.type === "message" && residentEntries.get(entry.id);
+    if (!resident || isProxy(resident) || entry.type !== "message") {
+      continue;
+    }
+    if (entry.message === Object.getOwnPropertyDescriptor(resident, "message")?.value) {
+      continue;
+    }
+    // Fresh reloads own their string replacement; retained immutable payloads already share it.
+    if (Object.isFrozen(entry.message)) {
+      entry.message = cloneTranscriptView(entry.message, { shareImmutablePayloads: false });
+    }
+    reuse(entry, resident);
+  }
+}
+
+export function buildInitialContext(
+  branch: SessionEntry[],
+  residentEntries?: ReadonlyMap<string, SessionEntry>,
+): SessionContext {
+  if (residentEntries) {
+    reuseResidentSessionEntryStrings(branch, residentEntries);
+  }
+  return buildCoreSessionContext(projectSessionModelContextEntries(branch));
 }
 
 export function buildSessionContext(
@@ -136,13 +361,7 @@ export function buildSessionContext(
     }
   }
 
-  let byId = contextById;
-  if (!byId) {
-    byId = new Map<string, SessionEntry>();
-    for (const entry of contextEntries) {
-      byId.set(entry.id, entry);
-    }
-  }
+  const byId = contextById ?? new Map(contextEntries.map((entry) => [entry.id, entry]));
 
   if (leafId === null) {
     return { messages: [], thinkingLevel: "off", model: null };
@@ -154,8 +373,10 @@ export function buildSessionContext(
   }
 
   const path: SessionEntry[] = [];
+  const seen = new Set<string>();
   let current: SessionEntry | undefined = leaf;
-  while (current) {
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
     path.push(current);
     current = current.parentId ? byId.get(current.parentId) : undefined;
   }
@@ -163,30 +384,43 @@ export function buildSessionContext(
   return buildCoreSessionContext(path as CoreSessionTreeEntry[]) as SessionContext;
 }
 
-function parseJsonlEntries(content: string): FileEntry[] {
-  const entries: FileEntry[] = [];
-  let skipped = 0;
-  for (const line of content.trim().split("\n")) {
-    if (!line.trim()) {
-      continue;
-    }
-    try {
-      entries.push(normalizeLoadedFileEntry(JSON.parse(line) as FileEntry));
-    } catch {
-      skipped += 1;
+export function buildSessionTree(
+  entries: readonly SessionEntry[],
+  labelsById: ReadonlyMap<string, string>,
+  labelTimestampsById: ReadonlyMap<string, SessionEntry["timestamp"]>,
+  resolveParentId: (parentId: string | null) => string | null,
+): SessionTreeNode[] {
+  const nodeMap = new Map<string, SessionTreeNode>();
+  const roots: SessionTreeNode[] = [];
+  for (const entry of entries) {
+    nodeMap.set(entry.id, {
+      entry,
+      children: [],
+      label: labelsById.get(entry.id),
+      labelTimestamp: labelTimestampsById.get(entry.id),
+    });
+  }
+  for (const entry of entries) {
+    const node = nodeMap.get(entry.id)!;
+    const parentId = resolveParentId(entry.parentId);
+    const parent = parentId !== null && parentId !== entry.id ? nodeMap.get(parentId) : undefined;
+    if (parent) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
     }
   }
-  if (skipped > 0) {
-    logWarn(
-      `parseJsonlEntries: skipped ${skipped} malformed JSONL line(s) — ` +
-        `${entries.length} valid entries were loaded`,
+  for (const node of nodeMap.values()) {
+    node.children.sort(
+      (left, right) =>
+        new Date(left.entry.timestamp).getTime() - new Date(right.entry.timestamp).getTime(),
     );
   }
-  return entries;
+  return roots;
 }
 
 export function normalizeLoadedFileEntry(entry: FileEntry): FileEntry {
-  if (!isJsonRecord(entry) || entry.type !== "message" || !isJsonRecord(entry.message)) {
+  if (!isRecord(entry) || entry.type !== "message" || !isRecord(entry.message)) {
     return entry;
   }
   const message: Record<string, unknown> = entry.message;
@@ -195,238 +429,9 @@ export function normalizeLoadedFileEntry(entry: FileEntry): FileEntry {
     typeof message.content === "string"
   ) {
     message.content = [{ type: "text", text: message.content }];
-  } else if (message.role === "toolResult" && isJsonRecord(message.content)) {
+    stripCompactionReplayCheckpointInPlace(message);
+  } else if (message.role === "toolResult" && isRecord(message.content)) {
     message.content = [message.content];
   }
   return entry;
-}
-
-export function isJsonRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isSessionEntryType(type: unknown): boolean {
-  switch (type) {
-    case "message":
-    case "thinking_level_change":
-    case "model_change":
-    case "compaction":
-    case "reset":
-    case "branch_summary":
-    case "custom":
-    case "custom_message":
-    case "label":
-    case "session_info":
-      return true;
-    default:
-      return false;
-  }
-}
-
-export function isIndexedSessionEntry(entry: unknown): entry is SessionEntry {
-  if (
-    !isJsonRecord(entry) ||
-    !isSessionEntryType(entry.type) ||
-    typeof entry.id !== "string" ||
-    entry.id.length === 0 ||
-    (entry.parentId !== undefined &&
-      entry.parentId !== null &&
-      typeof entry.parentId !== "string") ||
-    (entry.timestamp !== undefined && typeof entry.timestamp !== "string")
-  ) {
-    return false;
-  }
-  switch (entry.type) {
-    case "message":
-      return isReadableMessage(entry.message);
-    case "thinking_level_change":
-      return typeof entry.thinkingLevel === "string" && entry.thinkingLevel.length > 0;
-    case "model_change":
-      return (
-        typeof entry.provider === "string" &&
-        entry.provider.length > 0 &&
-        typeof entry.modelId === "string" &&
-        entry.modelId.length > 0
-      );
-    case "compaction":
-      return (
-        typeof entry.summary === "string" &&
-        typeof entry.firstKeptEntryId === "string" &&
-        entry.firstKeptEntryId.length > 0 &&
-        typeof entry.tokensBefore === "number"
-      );
-    case "reset":
-      return (
-        ["new", "reset", "idle", "daily", "cron-stale"].includes(String(entry.reason)) &&
-        (entry.firstKeptEntryId === undefined || typeof entry.firstKeptEntryId === "string")
-      );
-    case "branch_summary":
-      return typeof entry.fromId === "string" && typeof entry.summary === "string";
-    case "custom":
-      return typeof entry.customType === "string" && entry.customType.length > 0;
-    case "custom_message":
-      return (
-        typeof entry.customType === "string" &&
-        entry.customType.length > 0 &&
-        isReadableContent(entry.content) &&
-        typeof entry.display === "boolean"
-      );
-    case "label":
-      return (
-        typeof entry.targetId === "string" &&
-        entry.targetId.length > 0 &&
-        (entry.label === undefined || typeof entry.label === "string")
-      );
-    case "session_info":
-      return entry.name === undefined || typeof entry.name === "string";
-    default:
-      return false;
-  }
-}
-
-function isReadableContent(value: unknown): boolean {
-  return (
-    typeof value === "string" ||
-    (Array.isArray(value) &&
-      value.every((part) => isJsonRecord(part) && typeof part.type === "string"))
-  );
-}
-
-function isReadableMessage(value: unknown): boolean {
-  if (!isJsonRecord(value) || typeof value.role !== "string") {
-    return false;
-  }
-  switch (value.role) {
-    case "user":
-    case "assistant":
-      return isReadableContent(value.content);
-    case "toolResult":
-      return (
-        typeof value.toolCallId === "string" &&
-        typeof value.toolName === "string" &&
-        typeof value.isError === "boolean" &&
-        Array.isArray(value.content)
-      );
-    case "custom":
-      return typeof value.customType === "string" && isReadableContent(value.content);
-    case "bashExecution":
-      return typeof value.command === "string" && typeof value.output === "string";
-    default:
-      return false;
-  }
-}
-
-function isReadableLegacySessionEntry(value: unknown): value is FileEntry {
-  const message = isJsonRecord(value) && value.type === "message" ? value.message : undefined;
-  const readableLegacyMessage =
-    isJsonRecord(message) && message.role === "hookMessage"
-      ? isReadableContent(message.content)
-      : isReadableMessage(message);
-  return (
-    isJsonRecord(value) &&
-    isSessionEntryType(value.type) &&
-    (value.type !== "message" || readableLegacyMessage)
-  );
-}
-
-function normalizePersistedLegacyHookMessage(value: unknown): unknown {
-  if (!isJsonRecord(value) || value.type !== "message" || !isJsonRecord(value.message)) {
-    return value;
-  }
-  const message = value.message;
-  if (
-    message.role !== "custom" ||
-    message.customType !== undefined ||
-    !isReadableContent(message.content)
-  ) {
-    return value;
-  }
-  return { ...value, message: { ...message, customType: "hook" } };
-}
-
-export function parseParentLinkedOpaqueEntry(
-  record: unknown,
-): { id: string; parentId: string | null } | undefined {
-  if (
-    !isJsonRecord(record) ||
-    record.type === "session" ||
-    record.type === "leaf" ||
-    typeof record.id !== "string" ||
-    record.id.length === 0 ||
-    (record.parentId !== null && typeof record.parentId !== "string")
-  ) {
-    return undefined;
-  }
-  return { id: record.id, parentId: record.parentId };
-}
-
-export function parseOpaqueLeafEntry(record: unknown):
-  | {
-      id: string;
-      parentId: string | null;
-      targetId: string | null;
-      appendParentId?: string | null;
-      appendMode?: "side";
-    }
-  | undefined {
-  if (
-    !isJsonRecord(record) ||
-    record.type !== "leaf" ||
-    typeof record.id !== "string" ||
-    record.id.length === 0 ||
-    (record.parentId !== null && typeof record.parentId !== "string") ||
-    (record.targetId !== null && typeof record.targetId !== "string") ||
-    (record.appendParentId !== undefined &&
-      record.appendParentId !== null &&
-      typeof record.appendParentId !== "string") ||
-    (record.appendMode !== undefined && record.appendMode !== "side")
-  ) {
-    return undefined;
-  }
-  return {
-    id: record.id,
-    parentId: record.parentId,
-    targetId: record.targetId,
-    ...(record.appendParentId !== undefined ? { appendParentId: record.appendParentId } : {}),
-    ...(record.appendMode === "side" ? { appendMode: record.appendMode } : {}),
-  };
-}
-
-export function partitionSessionFileEntries(entries: readonly FileEntry[]): {
-  fileEntries: FileEntry[];
-  opaqueEntries: Array<{ index: number; record: unknown }>;
-  fileEntriesByOriginalIndex: Array<FileEntry | undefined>;
-} {
-  const fileEntries: FileEntry[] = [];
-  const opaqueEntries: Array<{ index: number; record: unknown }> = [];
-  const fileEntriesByOriginalIndex: Array<FileEntry | undefined> = [];
-  const header = entries.find(
-    (entry) => isJsonRecord(entry) && entry.type === "session" && typeof entry.id === "string",
-  ) as SessionHeader | undefined;
-  const acceptsLegacyEntries = (header?.version ?? 1) < CURRENT_SESSION_VERSION;
-  let hasHeader = false;
-  for (const [originalIndex, rawEntry] of entries.entries()) {
-    const entry = normalizePersistedLegacyHookMessage(rawEntry) as FileEntry;
-    if (
-      !hasHeader &&
-      isJsonRecord(entry) &&
-      entry.type === "session" &&
-      typeof entry.id === "string"
-    ) {
-      fileEntries.push(entry as unknown as SessionHeader);
-      fileEntriesByOriginalIndex[originalIndex] = entry;
-      hasHeader = true;
-      continue;
-    }
-    if (
-      isIndexedSessionEntry(entry) ||
-      (acceptsLegacyEntries && isReadableLegacySessionEntry(entry))
-    ) {
-      fileEntries.push(entry);
-      fileEntriesByOriginalIndex[originalIndex] = entry;
-      continue;
-    }
-    opaqueEntries.push({ index: fileEntries.length, record: entry });
-  }
-  return { fileEntries, opaqueEntries, fileEntriesByOriginalIndex };
 }

@@ -1,50 +1,104 @@
-// Gateway Protocol schema module defines protocol validation shapes.
-import type { Static } from "typebox";
+import type { Static, TSchema } from "typebox";
 import { Type } from "typebox";
 import { closedObject } from "./closed-object.js";
 import { NonEmptyString } from "./primitives.js";
+import { stringLiteralUnion } from "./string-literal-union.js";
 
-/**
- * Device pairing and token-management protocol schemas.
- *
- * These payloads cross the gateway approval boundary, so request ids and device
- * ids stay explicit and feature handlers own the authorization checks.
- */
-/** Lists pending and approved device pairing records. */
+// Feature handlers own authorization; schemas keep request and device identities explicit.
 export const DevicePairListParamsSchema = closedObject({});
 
-/** Approves a pending pairing request by request id. */
 export const DevicePairApproveParamsSchema = closedObject({ requestId: NonEmptyString });
 
-/** Rejects a pending pairing request by request id. */
 export const DevicePairRejectParamsSchema = closedObject({ requestId: NonEmptyString });
 
-/** Removes an approved or remembered device by device id. */
 export const DevicePairRemoveParamsSchema = closedObject({ deviceId: NonEmptyString });
 
-/** Operator-assigned label for a paired device (max 64 chars after protocol bound). */
 const DevicePairLabelString = Type.String({ minLength: 1, maxLength: 64 });
 
-/** Renames a paired device while preserving its stable device id. */
 export const DevicePairRenameParamsSchema = closedObject({
   deviceId: NonEmptyString,
   label: DevicePairLabelString,
 });
 
-/** Rotates or issues a device token for a specific role/scope grant. */
 export const DeviceTokenRotateParamsSchema = closedObject({
   deviceId: NonEmptyString,
   role: NonEmptyString,
   scopes: Type.Optional(Type.Array(NonEmptyString)),
 });
 
-/** Revokes one role-bound device token grant. */
+/**
+ * Rotation outcome. `tokenDelivery` records how the replacement reached its owner so
+ * clients report a fact instead of inferring one from the absent `token`: the gateway
+ * echoes the bearer token only to a device rotating its own token, and never on a
+ * shared/admin cross-device rotation (see `docs/cli/devices.md`). Optional because
+ * gateways released before this field omit it entirely.
+ */
+const withoutDeviceTokenRotateResultField = (field: "token" | "tokenDelivery"): TSchema =>
+  ({ not: { required: [field] } }) as TSchema;
+
+export const DeviceTokenRotateResultSchema = Type.Object(
+  {
+    deviceId: NonEmptyString,
+    role: NonEmptyString,
+    token: Type.Optional(NonEmptyString),
+    scopes: Type.Array(NonEmptyString),
+    rotatedAtMs: Type.Integer({ minimum: 0 }),
+    tokenDelivery: Type.Optional(Type.String({ enum: ["in-band", "withheld-cross-device"] })),
+  },
+  {
+    additionalProperties: false,
+    // Keep one concrete object for generated clients while the wire schema
+    // rejects contradictory delivery facts. The third branch is the shipped
+    // pre-tokenDelivery response shape retained for older Gateways.
+    allOf: [
+      Type.Union([
+        Type.Object({ token: NonEmptyString, tokenDelivery: Type.Literal("in-band") }),
+        Type.Intersect([
+          Type.Object({ tokenDelivery: Type.Literal("withheld-cross-device") }),
+          withoutDeviceTokenRotateResultField("token"),
+        ]),
+        withoutDeviceTokenRotateResultField("tokenDelivery"),
+      ]),
+    ],
+  },
+);
+
 export const DeviceTokenRevokeParamsSchema = closedObject({
   deviceId: NonEmptyString,
   role: NonEmptyString,
 });
 
-/** Event emitted when a client opens or refreshes a pairing request. */
+export const ScopeUpgradeRequestSchema = closedObject({
+  scopes: Type.Array(NonEmptyString, { minItems: 1, maxItems: 8, uniqueItems: true }),
+});
+
+export const ScopeUpgradeWaitSchema = closedObject({ requestId: NonEmptyString });
+
+export const ScopeUpgradeRegistrationSchema = closedObject({ requestId: NonEmptyString });
+
+export const ScopeUpgradeApprovedSchema = closedObject({
+  status: Type.Literal("approved"),
+  requestId: NonEmptyString,
+  deviceToken: NonEmptyString,
+  scopes: Type.Array(NonEmptyString, { minItems: 1, maxItems: 8, uniqueItems: true }),
+});
+
+export const ScopeUpgradeRejectedSchema = closedObject({
+  status: Type.Literal("rejected"),
+  requestId: NonEmptyString,
+});
+
+export const ScopeUpgradeExpiredSchema = closedObject({
+  status: Type.Literal("expired"),
+  requestId: NonEmptyString,
+});
+
+export const ScopeUpgradeResultSchema = Type.Union([
+  ScopeUpgradeApprovedSchema,
+  ScopeUpgradeRejectedSchema,
+  ScopeUpgradeExpiredSchema,
+]);
+
 export const DevicePairRequestedEventSchema = closedObject({
   requestId: NonEmptyString,
   deviceId: NonEmptyString,
@@ -64,12 +118,47 @@ export const DevicePairRequestedEventSchema = closedObject({
   ts: Type.Integer({ minimum: 0 }),
 });
 
-/** Event emitted after a pairing request is approved, rejected, or otherwise resolved. */
+/** Opaque non-secret setup correlation id; never derived from the bearer setup code. */
+const SetupIdSchema = Type.String({ minLength: 1, maxLength: 128 });
+
 export const DevicePairResolvedEventSchema = closedObject({
   requestId: NonEmptyString,
   deviceId: NonEmptyString,
   decision: NonEmptyString,
   ts: Type.Integer({ minimum: 0 }),
+});
+
+/**
+ * Terminal outcome of one setup credential, recorded when its exact bootstrap
+ * handoff delivered credentials. Carries no bearer material and no
+ * token-derived identifier.
+ */
+export const DevicePairSetupCompletedEventSchema = closedObject({
+  setupId: SetupIdSchema,
+  deviceId: NonEmptyString,
+  deviceName: Type.Optional(NonEmptyString),
+  access: stringLiteralUnion(["full", "limited", "node"]),
+  ts: Type.Integer({ minimum: 0 }),
+});
+
+/** Event emitted when the bearer was retired but response delivery could not be confirmed. */
+export const DevicePairSetupDeliveryUncertainEventSchema = DevicePairSetupCompletedEventSchema;
+
+/** Reconciles one setup credential the caller already holds a `setupId` for. */
+export const DevicePairSetupStatusParamsSchema = closedObject({
+  setupId: SetupIdSchema,
+});
+
+/**
+ * Authoritative answer to "what happened to this exact setup credential?".
+ * `completion` means the credential-bearing response finished. `deliveryUncertain`
+ * means the bearer was retired for replay safety but the client may not have
+ * received its credential. When both are absent, the setup is outstanding,
+ * expired, or already past retention.
+ */
+export const DevicePairSetupStatusResultSchema = closedObject({
+  completion: Type.Optional(DevicePairSetupCompletedEventSchema),
+  deliveryUncertain: Type.Optional(DevicePairSetupDeliveryUncertainEventSchema),
 });
 
 const SetupCodeQrDataUrlSchema = Type.String({
@@ -91,28 +180,67 @@ export const DevicePairSetupCodeParamsSchema = closedObject({
   publicUrl: Type.Optional(NonEmptyString),
   preferRemoteUrl: Type.Optional(Type.Boolean()),
   includeQr: Type.Optional(Type.Boolean()),
-  bootstrapProfile: Type.Optional(Type.String({ enum: ["limited", "node"] })),
+  bootstrapProfile: Type.Optional(Type.String({ enum: ["limited", "node", "voice-node"] })),
+  joinUrl: Type.Optional(Type.Literal(true)),
 });
 
 /**
- * Setup code plus non-secret connection metadata. `auth` is a label only
- * ("token" | "password"); the gateway credential itself is never returned.
+ * Setup code plus non-secret connection metadata. `setupId` is an opaque
+ * correlation id independent from the embedded bearer, while `expiresAtMs`
+ * is the authoritative setup expiry. `auth` is a label only ("token" |
+ * "password" | "trusted-proxy"); the gateway credential itself is never returned.
  * `accessDowngraded` reports the plaintext-LAN safety fallback from full to
  * limited access so the presenting client can explain how to upgrade.
  */
 export const DevicePairSetupCodeResultSchema = closedObject({
+  // Optional on the wire so separately shipped native clients can still decode
+  // setup-code responses from older v4 gateways that predate lifecycle metadata.
+  setupId: Type.Optional(SetupIdSchema),
   setupCode: NonEmptyString,
+  joinUrl: Type.Optional(NonEmptyString),
+  command: Type.Optional(NonEmptyString),
+  serviceCommand: Type.Optional(NonEmptyString),
+  installedCommand: Type.Optional(NonEmptyString),
+  versionNote: Type.Optional(NonEmptyString),
   qrDataUrl: Type.Optional(SetupCodeQrDataUrlSchema),
   gatewayUrl: NonEmptyString,
   gatewayUrls: Type.Optional(
     Type.Array(NonEmptyString, { minItems: 2, maxItems: 8, uniqueItems: true }),
   ),
-  auth: Type.Union([Type.Literal("token"), Type.Literal("password")]),
+  auth: stringLiteralUnion(["token", "password", "trusted-proxy"]),
   urlSource: NonEmptyString,
-  access: Type.Optional(
-    Type.Union([Type.Literal("full"), Type.Literal("limited"), Type.Literal("node")]),
-  ),
+  access: Type.Optional(stringLiteralUnion(["full", "limited", "node"])),
   accessDowngraded: Type.Optional(Type.Boolean()),
+  expiresAtMs: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+/**
+ * Reads the browser request named by a code shown in that browser. Adding
+ * `requestId` and `decision` settles exactly that inspected request, so a decision
+ * cannot land on a request the operator never saw. Approval pairs the browser as an
+ * operator device with the Control UI's admin scopes under the caller's own scopes,
+ * so this method requires operator.admin (enforced by the core method descriptor).
+ */
+export const DevicePairCodeParamsSchema = closedObject({
+  code: Type.String({ minLength: 8, maxLength: 16 }),
+  requestId: Type.Optional(NonEmptyString),
+  decision: Type.Optional(stringLiteralUnion(["approve", "reject"])),
+});
+
+/**
+ * What an operator needs to recognize the requesting browser. `remoteIp` is the
+ * Gateway's view of the peer; `userAgent` and `origin` are reported by the browser.
+ */
+export const DevicePairCodeResultSchema = closedObject({
+  status: stringLiteralUnion(["pending", "approved", "rejected"]),
+  requestId: NonEmptyString,
+  code: NonEmptyString,
+  deviceId: NonEmptyString,
+  remoteIp: Type.Optional(NonEmptyString),
+  userAgent: Type.Optional(NonEmptyString),
+  origin: Type.Optional(NonEmptyString),
+  createdAtMs: Type.Integer({ minimum: 0 }),
+  expiresAtMs: Type.Integer({ minimum: 0 }),
 });
 
 // Wire types derive directly from local schema consts so public d.ts graphs never
@@ -121,8 +249,21 @@ export type DevicePairListParams = Static<typeof DevicePairListParamsSchema>;
 export type DevicePairApproveParams = Static<typeof DevicePairApproveParamsSchema>;
 export type DevicePairRejectParams = Static<typeof DevicePairRejectParamsSchema>;
 export type DevicePairRemoveParams = Static<typeof DevicePairRemoveParamsSchema>;
+export type DevicePairCodeParams = Static<typeof DevicePairCodeParamsSchema>;
+export type DevicePairCodeResult = Static<typeof DevicePairCodeResultSchema>;
 export type DevicePairSetupCodeParams = Static<typeof DevicePairSetupCodeParamsSchema>;
 export type DevicePairSetupCodeResult = Static<typeof DevicePairSetupCodeResultSchema>;
+export type DevicePairSetupCompletedEvent = Static<typeof DevicePairSetupCompletedEventSchema>;
+export type DevicePairSetupDeliveryUncertainEvent = Static<
+  typeof DevicePairSetupDeliveryUncertainEventSchema
+>;
+export type DevicePairSetupStatusParams = Static<typeof DevicePairSetupStatusParamsSchema>;
+export type DevicePairSetupStatusResult = Static<typeof DevicePairSetupStatusResultSchema>;
 export type DevicePairRenameParams = Static<typeof DevicePairRenameParamsSchema>;
 export type DeviceTokenRotateParams = Static<typeof DeviceTokenRotateParamsSchema>;
+export type DeviceTokenRotateResult = Static<typeof DeviceTokenRotateResultSchema>;
 export type DeviceTokenRevokeParams = Static<typeof DeviceTokenRevokeParamsSchema>;
+export type ScopeUpgradeRequest = Static<typeof ScopeUpgradeRequestSchema>;
+export type ScopeUpgradeWait = Static<typeof ScopeUpgradeWaitSchema>;
+export type ScopeUpgradeRegistration = Static<typeof ScopeUpgradeRegistrationSchema>;
+export type ScopeUpgradeResult = Static<typeof ScopeUpgradeResultSchema>;

@@ -1,0 +1,28 @@
+title: Control UI cron
+
+scenario:
+  id: control-ui-cron
+  surface: control-ui
+  category: control-ui.cron
+  coverage:
+    primary:
+      - control-ui.cron
+  objective: Prove Automations supports read-only browsing, run-history filtering, and agent-turn job creation and editing.
+  successCriteria:
+    - Read-only operators can view automation details and run history without mutation requests.
+    - Status and delivery history filters send the matching cron.runs request parameters.
+    - Creating and editing agent-turn jobs preserves an explicit zero timeout in the submitted payloads.
+  docsRefs:
+    - docs/web/control-ui.md
+    - docs/automation/cron-jobs.md
+    - docs/help/testing.md
+  codeRefs:
+    - ui/src/e2e/cron-filters.e2e.test.ts
+    - ui/src/pages/cron/cron-page.tsx
+    - ui/src/pages/cron/view.tsx
+    - ui/src/lib/cron/index.ts
+  execution:
+    kind: playwright
+    path: ui/src/e2e/cron-filters.e2e.test.ts
+    testNamePattern: "keeps read-only operators on Cron browse and history surfaces|announces selected history filters and sends their Gateway request values|creates and edits agent-turn jobs with an explicit zero timeout"
+    summary: Canonical real-Chromium Automations coverage for read-only browsing, run-history filtering, and agent-turn job creation and editing.

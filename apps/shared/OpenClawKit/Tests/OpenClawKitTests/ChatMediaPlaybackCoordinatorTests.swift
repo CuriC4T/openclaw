@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import OpenClawChatUI
 
@@ -43,6 +44,7 @@ private final class RecordingNowPlayingOwner: ChatMediaNowPlayingOwner {
         duration: 42,
         elapsed: 3,
         playbackRate: 1)
+    var onCommand: (@MainActor (ChatMediaRemoteCommand) -> Void)?
     private(set) var commands: [ChatMediaRemoteCommand] = []
 
     func stopForMediaPlaybackInterruption() {}
@@ -54,12 +56,76 @@ private final class RecordingNowPlayingOwner: ChatMediaNowPlayingOwner {
             duration: 42,
             elapsed: 4,
             playbackRate: command == .pause ? 0 : 1)
+        self.onCommand?(command)
     }
 }
 
 @MainActor
 @Suite("Chat media playback coordinator")
 struct ChatMediaPlaybackCoordinatorTests {
+    @Test func `delayed earlier attachment cannot interrupt a later playback intent`() async {
+        let coordinator = ChatMediaPlaybackCoordinator(nowPlayingCenter: RecordingNowPlayingCenter())
+        let slow = RecordingMediaPlaybackOwner()
+        let fast = RecordingMediaPlaybackOwner()
+        let slowIntent = coordinator.claimPlaybackIntent()
+        var finishLoading: CheckedContinuation<Void, Never>?
+        let delayed = Task { @MainActor in
+            await withCheckedContinuation { finishLoading = $0 }
+            return coordinator.activate(slow, intent: slowIntent)
+        }
+        while finishLoading == nil { await Task.yield() }
+
+        let fastIntent = coordinator.claimPlaybackIntent()
+        #expect(coordinator.activate(fast, intent: fastIntent))
+        finishLoading?.resume()
+
+        #expect(await delayed.value == false)
+        #expect(coordinator.isActive(fast))
+        #expect(fast.interruptionCount == 0)
+    }
+
+    @Test func `direct playback supersedes a pending attachment even after release`() {
+        let coordinator = ChatMediaPlaybackCoordinator(nowPlayingCenter: RecordingNowPlayingCenter())
+        let pending = RecordingMediaPlaybackOwner()
+        let direct = RecordingMediaPlaybackOwner()
+        let intent = coordinator.claimPlaybackIntent()
+
+        coordinator.activate(direct)
+        coordinator.release(direct)
+
+        #expect(!coordinator.activate(pending, intent: intent))
+        #expect(!coordinator.isActive(pending))
+    }
+
+    @Test func `pausing active playback supersedes a pending attachment`() {
+        let coordinator = ChatMediaPlaybackCoordinator(nowPlayingCenter: RecordingNowPlayingCenter())
+        let active = RecordingMediaPlaybackOwner()
+        let pending = RecordingMediaPlaybackOwner()
+        coordinator.activate(active)
+        let intent = coordinator.claimPlaybackIntent()
+
+        coordinator.playbackDidPause(active)
+
+        #expect(!coordinator.activate(pending, intent: intent))
+        #expect(coordinator.isActive(active))
+        #expect(active.interruptionCount == 0)
+    }
+
+    @Test func `remote pause supersedes a pending attachment`() {
+        let center = RecordingNowPlayingCenter()
+        let coordinator = ChatMediaPlaybackCoordinator(nowPlayingCenter: center)
+        let active = RecordingNowPlayingOwner()
+        let pending = RecordingMediaPlaybackOwner()
+        coordinator.activate(active)
+        let intent = coordinator.claimPlaybackIntent()
+
+        center.send(.pause)
+
+        #expect(!coordinator.activate(pending, intent: intent))
+        #expect(active.commands == [.pause])
+        #expect(coordinator.isActive(active))
+    }
+
     @Test func `new playback owner interrupts the previous owner exactly once`() {
         let coordinator = ChatMediaPlaybackCoordinator(nowPlayingCenter: RecordingNowPlayingCenter())
         let first = RecordingMediaPlaybackOwner()
@@ -120,5 +186,33 @@ struct ChatMediaPlaybackCoordinatorTests {
 
         #expect(center.published.count == 1)
         #expect(center.clearCount == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func `remote commands never republish a released or replaced owner`(replaceOwner: Bool) {
+        let center = RecordingNowPlayingCenter()
+        let coordinator = ChatMediaPlaybackCoordinator(nowPlayingCenter: center)
+        let owner = RecordingNowPlayingOwner()
+        let replacement = RecordingNowPlayingOwner()
+        replacement.nowPlayingMetadata = ChatMediaNowPlayingMetadata(
+            title: "next.mov",
+            duration: 12,
+            elapsed: 0,
+            playbackRate: 1)
+        owner.onCommand = { [weak owner] _ in
+            guard let owner else { return }
+            if replaceOwner {
+                coordinator.activate(replacement)
+            } else {
+                coordinator.release(owner)
+            }
+        }
+
+        coordinator.activate(owner)
+        center.send(.play)
+
+        #expect(center.published.count == (replaceOwner ? 2 : 1))
+        #expect(center.published.last?.title == (replaceOwner ? "next.mov" : "clip.mov"))
+        #expect(center.clearCount == (replaceOwner ? 0 : 1))
     }
 }

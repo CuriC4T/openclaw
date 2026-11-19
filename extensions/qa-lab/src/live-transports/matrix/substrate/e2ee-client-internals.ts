@@ -10,36 +10,6 @@ export const MATRIX_QA_E2EE_SYNC_FILTER = {
   },
 };
 
-export async function runMatrixQaE2eeClientOperation<T>(params: {
-  label: string;
-  run: () => Promise<T>;
-  stop: () => void;
-  timeoutMs: number;
-}): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      // Matrix SDK encryption can wait indefinitely after room-key sharing. Stop this
-      // disposable QA client so the scenario can fail and release its worker resources.
-      try {
-        params.stop();
-      } catch {
-        // Preserve the operation timeout as the actionable failure.
-      }
-      reject(new Error(`${params.label} timed out after ${params.timeoutMs}ms`));
-    }, params.timeoutMs);
-    timer.unref();
-  });
-
-  try {
-    return await Promise.race([params.run(), timeout]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
 function shouldRecordMatrixQaObservedEventUpdate(params: {
   next: MatrixQaObservedEvent;
   previous: MatrixQaObservedEvent | undefined;
@@ -50,13 +20,8 @@ function shouldRecordMatrixQaObservedEventUpdate(params: {
   }
   const next = params.next;
   return (
-    (previous.body === undefined && next.body !== undefined) ||
-    (previous.formattedBody === undefined && next.formattedBody !== undefined) ||
-    (previous.msgtype === undefined && next.msgtype !== undefined) ||
-    (previous.relatesTo === undefined && next.relatesTo !== undefined) ||
-    (previous.mentions === undefined && next.mentions !== undefined) ||
-    (previous.attachment === undefined && next.attachment !== undefined)
-  );
+    ["body", "formattedBody", "msgtype", "relatesTo", "mentions", "attachment"] as const
+  ).some((field) => previous[field] === undefined && next[field] !== undefined);
 }
 
 export function createMatrixQaE2eeObservedEventRecorder(params: {
@@ -122,11 +87,7 @@ export function createMatrixQaE2eeObservedEventRecorder(params: {
   };
 }
 
-function buildMatrixQaE2eeStoragePaths(params: {
-  actorId: MatrixQaE2eeActorId;
-  outputDir: string;
-  scenarioId: string;
-}) {
+function buildMatrixQaE2eeStoragePaths(params: Parameters<typeof prepareMatrixQaE2eeStorage>[0]) {
   const rootDir = path.join(params.outputDir, "matrix-e2ee", "accounts", params.actorId);
   const accountDir = path.join(rootDir, "account");
   const runKey = path

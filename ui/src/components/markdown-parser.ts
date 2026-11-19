@@ -1,81 +1,193 @@
-import MarkdownIt from "markdown-it";
-import markdownItTaskLists from "markdown-it-task-lists";
-import { t } from "../i18n/index.ts";
+import MarkdownIt, { type MarkdownIt as MarkdownItParser, type Token } from "markdown-it";
+import markdownItCjkFriendly from "markdown-it-cjk-friendly";
+import { escapeHtml } from "../../../src/shared/html-escape.js";
+import { fileKindForPath, shortestFileLabels } from "./file-kind.ts";
+import { isGitHubHost } from "./github-link-eligibility.ts";
 import {
-  installAssistantTranscriptRoleImageRenderer,
-  installAssistantTranscriptRoleMarkdown,
-} from "./markdown-assistant-transcript.ts";
+  decodeGitHubPathSegment,
+  formatGitHubItemReference,
+  parseGitHubItemPath,
+} from "./github-link-target.ts";
+import { installAssistantTranscriptRoleMarkdown } from "./markdown-assistant-transcript.ts";
 import { markdownCodeBlockCopyText, renderMarkdownCodeBlock } from "./markdown-code-blocks.ts";
 import { installMarkdownDetails } from "./markdown-details.ts";
 import {
   isHostLocalMarkdownFileHref,
   MARKDOWN_FILE_LINK_SCAN_RE,
   parseMarkdownFileLinkTarget,
+  parseMarkdownDocumentFileLinkTarget,
   splitMarkdownFileLineSuffix,
 } from "./markdown-file-links.ts";
+import { installMarkdownGitHubRefs } from "./markdown-github-refs.ts";
+import { installMarkdownHumanMentions } from "./markdown-human-mentions.ts";
+import { hasMarkdownLinkBoundaries } from "./markdown-link-boundary.ts";
 import type { MarkdownRenderEnv } from "./markdown-render-options.ts";
-import { escapeMarkdownHtml } from "./markdown-text.ts";
+import { installMarkdownSessionLinks } from "./markdown-session-links.ts";
+import { installMarkdownTables } from "./markdown-tables.ts";
+import {
+  markdownInlineChildren,
+  replaceMarkdownTextMatches,
+} from "./markdown-text-replacements.ts";
+import { installMarkdownWindowsPaths } from "./markdown-windows-paths.ts";
 
-const INLINE_DATA_IMAGE_RE = /^data:image\/[a-z0-9.+-]+;base64,/i;
-// CJK character ranges for URL boundary detection (RFC 3986: CJK is not valid in raw URLs).
-// CJK Unified Ideographs, CJK Symbols/Punctuation, Fullwidth Forms, Hiragana, Katakana,
-// Hangul Syllables, and CJK Compatibility Ideographs.
-const CJK_RE = new RegExp(
-  "[\\u2E80-\\u2FFF\\u3000-\\u303F\\u3040-\\u309F\\u30A0-\\u30FF\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uAC00-\\uD7AF\\uF900-\\uFAFF\\uFF01-\\uFF60]",
-);
+// formatAudioTranscriptForAgent stores this model-facing label in conversation history.
+const AUDIO_TRANSCRIPT_PREFIX = '[Audio transcript (machine-generated, untrusted)]: "';
 
-function normalizeMarkdownImageLabel(text?: string | null): string {
-  const trimmed = text?.trim();
-  return trimmed ? trimmed : "image";
+// Only #RRGGBB previews; shorter forms collide with issue/PR numbers like #2536.
+const HEX_COLOR_RE = /#[\da-f]{6}(?![\da-f])/gi;
+
+const DISALLOWED_LINK_SCHEME_RE = /^(?!(?:https?|mailto):)[a-z][a-z0-9+.-]*:/i;
+// Raw CJK suffixes delimit autolinks; percent-encoded URL content stays intact.
+const CJK_CHARACTER_RE =
+  /[\u2E80-\u2FFF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF01-\uFF60]/;
+
+// CSS paints the decorative mark outside the accessibility tree and copied text.
+const GITHUB_LINK_CLASS = "markdown-github-link";
+// Only generated URL labels may wrap at any character.
+const BARE_URL_CLASS = "markdown-bare-url";
+const CODE_SPAN_URL_BREAK_RE = /[\s\p{Cc}]/u;
+const FILE_REFERENCE_MARKER_RE = /[/\\:]/;
+
+// Label shortening needs every file target before applying any label.
+type MarkdownFileLinkDecoration = {
+  path: string;
+  reference: string;
+  applyLabel: (label: string) => void;
+};
+
+const PROGRESS_HTML_RE = /^(?:<progress(?:\s[^<>]*)?>\s*(?:<\/progress>)?|<\/progress>)$/iu;
+
+function renderRawMarkdownHtml(
+  tokens: readonly Token[],
+  index: number,
+  progressBars: boolean,
+  block: boolean,
+): string {
+  const token = tokens[index];
+  if (!token) {
+    return "";
+  }
+  const content = token.content;
+  if (progressBars) {
+    return PROGRESS_HTML_RE.test(content.trim()) ? content : "";
+  }
+  if (/^<br\s*\/?>$/iu.test(content.trim())) {
+    return block ? "<br>\n" : "<br>";
+  }
+  return escapeHtml(content) + (block ? "\n" : "");
 }
 
-function isFileLinkBoundaryBefore(value: string, index: number): boolean {
-  const char = value[index - 1];
-  return char === undefined || /\s/.test(char) || "([{<\"'`".includes(char);
+/** Authored labels differ from labels that merely repeat the reference. */
+function linkLabelText(children: readonly Token[], openIndex: number): string {
+  let label = "";
+  for (let cursor = openIndex + 1; cursor < children.length; cursor++) {
+    const token = children[cursor];
+    if (!token || token.type === "link_close") {
+      break;
+    }
+    if (token.type === "text" || token.type === "code_inline") {
+      label += token.content;
+    }
+  }
+  return label.trim();
 }
 
-function isFileLinkBoundaryAfter(value: string, index: number): boolean {
-  const char = value[index];
-  return char === undefined || /\s/.test(char) || ".,;:!?)]}>\"'".includes(char);
+function decorateFileLink(token: Token, target: { path: string; line: number | null }): void {
+  token.attrJoin("class", "markdown-file-link");
+  token.attrSet("role", "button");
+  token.attrSet("tabindex", "0");
+  token.attrSet("data-file-path", target.path);
+  token.attrSet("data-file-kind", fileKindForPath(target.path));
+  if (target.line !== null) {
+    token.attrSet("data-file-line", String(target.line));
+  }
 }
 
-export function createMarkdownParser(): MarkdownIt {
+function parseWebLinkHref(href: string): URL | null {
+  // Docs-relative rewriting runs later in markdown.ts.
+  const url = URL.parse(href);
+  return url?.protocol === "https:" || url?.protocol === "http:" ? url : null;
+}
+
+function formatGitHubLinkLabel(url: URL): string {
+  const segments = url.pathname.split("/").filter(Boolean);
+  const path = segments.map((segment) => decodeGitHubPathSegment(segment) ?? segment);
+  if (path.length === 2) {
+    return path.join("/");
+  }
+  if ((segments[2] === "blob" || segments[2] === "tree") && segments.length > 4) {
+    const basename = decodeGitHubPathSegment(segments.at(-1)!);
+    if (basename) {
+      // Tree refs may contain slashes; the omitted path is not just a folder.
+      return segments[2] === "tree" ? path.slice(0, 2).join("/") + "/…/" + basename : basename;
+    }
+  }
+  return ["github.com", ...path].join("/");
+}
+
+export function createMarkdownParser(): MarkdownItParser {
   const markdownParser = new MarkdownIt({
     html: true, // Enable HTML recognition so html_block/html_inline overrides can escape it
     breaks: true,
     linkify: true,
   });
-  const defaultCodeInlineRenderer = markdownParser.renderer.rules.code_inline!;
-
-  // Enable GFM strikethrough (~~text~~) to match original marked.js behavior.
-  // markdown-it uses <s> tags; we added "s" to the sanitizer allowlist.
+  markdownParser.use(markdownItCjkFriendly);
   markdownParser.enable("strikethrough");
-  installAssistantTranscriptRoleMarkdown(markdownParser, escapeMarkdownHtml);
+  markdownParser.block.ruler.before(
+    "reference",
+    "audio_transcript",
+    (state, startLine, _endLine, silent) => {
+      if ((state.sCount[startLine] ?? 0) - state.blkIndent >= 4) {
+        return false;
+      }
+      const start = (state.bMarks[startLine] ?? 0) + (state.tShift[startLine] ?? 0);
+      const end = state.eMarks[startLine] ?? state.src.length;
+      const line = state.src.slice(start, end);
+      if (!line.startsWith(AUDIO_TRANSCRIPT_PREFIX)) {
+        return false;
+      }
+      if (silent) {
+        return true;
+      }
+      // Without this presentation adapter, a transcript without spaces is a hidden
+      // Markdown link definition. Keep the persisted and model-facing bytes intact.
+      state.push("paragraph_open", "p", 1).map = [startLine, startLine + 1];
+      const inline = state.push("inline", "", 0);
+      inline.content = `\\${line}`;
+      inline.map = [startLine, startLine + 1];
+      inline.children = [];
+      state.push("paragraph_close", "p", -1);
+      state.line = startLine + 1;
+      return true;
+    },
+    { alt: ["reference"] },
+  );
+  installAssistantTranscriptRoleMarkdown(markdownParser);
   installMarkdownDetails(markdownParser);
+  installMarkdownTables(markdownParser);
+  installMarkdownWindowsPaths(markdownParser);
 
-  // Disable fuzzy link detection to prevent bare filenames like "README.md"
-  // from being auto-linked as "http://README.md". URLs with explicit protocol
-  // (https://...) and emails are still linkified.
-  //
-  // Alternative considered: extensions/matrix/src/matrix/format.ts uses fuzzyLink
-  // with a file-extension blocklist to filter false positives at render time.
-  // We chose the www-only approach instead because:
-  // 1. Matches original marked.js GFM behavior exactly (bare domains were never linked)
-  // 2. No blocklist to maintain — new TLDs like .ai, .io, .dev would need constant updates
-  // 3. Predictable behavior — users can always use explicit https:// for any URL
+  // Bare filenames such as README.md are not web destinations.
   markdownParser.linkify.set({ fuzzyLink: false });
 
-  // Re-enable www. prefix detection per GFM spec: bare URLs without protocol
-  // must start with "www." to be auto-linked. This avoids false positives on
-  // filenames while preserving expected behavior for "www.example.com".
-  // GFM spec: valid domain = alphanumeric/underscore/hyphen segments separated
-  // by periods, at least one period, no underscores in last two segments.
+  // A raw quote ends an HTTP URL in prose/JSON; encoded quotes remain URL data.
+  // Bound the input before matching so native path and punctuation rules still apply.
+  for (const schema of ["http:", "https:"]) {
+    markdownParser.linkify.add(schema, {
+      validate(text, pos, self) {
+        const pattern = self.re.get_http_validator();
+        const quote = text.indexOf('"', pos);
+        pattern.lastIndex = pos;
+        return pattern.exec(quote < 0 ? text : text.slice(0, quote))?.[0].length ?? 0;
+      },
+    });
+  }
+
+  // Keep GFM's www. autolinks without fuzzy filename detection.
   markdownParser.linkify.add("www", {
     validate(text, pos) {
       const tail = text.slice(pos);
-      // Match: . followed by domain and optional path, matching marked.js behavior.
-      // Stops at whitespace, < (HTML tag boundary), or CJK characters (RFC 3986:
-      // raw CJK is not valid in URLs; percent-encoded CJK like %E4%BD%A0 is fine).
+      // Preserve the previous autolink grammar, including its CJK boundary.
       const match = tail.match(
         /^\.(?:[a-zA-Z0-9-]+\.?)+[^\s<\u2E80-\u2FFF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF01-\uFF60]*/,
       );
@@ -84,10 +196,6 @@ export function createMarkdownParser(): MarkdownIt {
       }
       let length = match[0].length;
 
-      // Strip trailing punctuation per GFM extended autolink spec.
-      // GFM says: ?, !, ., ,, :, *, _, ~ are not part of the autolink if trailing.
-
-      // Balance checking config: closeChar -> openChar mapping.
       // Strip trailing close chars only when unbalanced (more closes than opens).
       // For self-matching pairs like "", open === close (strip if odd count).
       const balancePairs: Record<string, string> = {
@@ -98,62 +206,37 @@ export function createMarkdownParser(): MarkdownIt {
         "'": "'",
       };
 
-      // Pre-count balanced pairs to avoid O(n²) rescans.
-      // balance[closeChar] = count(open) - count(close), negative means unbalanced
-      const balance: Record<string, number> = {};
-      for (const [close, open] of Object.entries(balancePairs)) {
-        balance[close] = 0;
-        for (let index = 0; index < length; index++) {
-          const character = tail.charAt(index);
-          if (open === close) {
-            // Self-matching pair (e.g., "") — toggle between 0 and 1
-            if (character === open) {
-              balance[close] = balance[close] === 0 ? 1 : 0;
-            }
-          } else if (character === open) {
-            balance[close] = (balance[close] ?? 0) + 1;
-          } else if (character === close) {
-            balance[close] = (balance[close] ?? 0) - 1;
-          }
-        }
+      // Count delimiters in one pass; suffix removal never rescans the URL.
+      const counts: Record<string, number> = {};
+      for (const character of match[0]) {
+        counts[character] = (counts[character] ?? 0) + 1;
       }
 
       while (length > 0) {
         const character = tail.charAt(length - 1);
-        // GFM trailing punctuation: ?, !, ., ,, :, *, _, ~ stripped unconditionally.
         if (/[?!.,:*_~]/.test(character)) {
           length--;
           continue;
         }
         // GFM entity reference rule: strip trailing &entity; sequences.
         if (character === ";") {
-          // Backward scan to find & (O(n) total, avoids string allocation)
-          let index = length - 2;
-          while (index >= 0 && /[a-zA-Z0-9]/.test(tail.charAt(index))) {
-            index--;
-          }
-          // index < length - 2 ensures at least one alphanumeric between & and ;
-          if (index >= 0 && tail.charAt(index) === "&" && index < length - 2) {
+          const index = tail.lastIndexOf("&", length - 1);
+          if (/^&[a-zA-Z0-9]+;$/.test(tail.slice(index, length))) {
             length = index;
             continue;
           }
-          // Not an entity reference, stop stripping
           break;
         }
-        // Handle balanced pairs — only strip close char if unbalanced.
         const open = balancePairs[character];
-        if (open !== undefined) {
-          if (open === character) {
-            if ((balance[character] ?? 0) !== 0) {
-              balance[character] = 0;
-              length--;
-              continue;
-            }
-          } else if ((balance[character] ?? 0) < 0) {
-            balance[character] = (balance[character] ?? 0) + 1;
-            length--;
-            continue;
-          }
+        if (
+          open !== undefined &&
+          (open === character
+            ? counts[character]! % 2 !== 0
+            : counts[character]! > (counts[open] ?? 0))
+        ) {
+          counts[character]!--;
+          length--;
+          continue;
         }
         break;
       }
@@ -164,272 +247,424 @@ export function createMarkdownParser(): MarkdownIt {
     },
   });
 
-  // Override default link validator to allow all URLs through to renderers.
-  // marked.js does not validate URLs at all — it generates <a>/<img> tags for
-  // everything and relies on DOMPurify to strip dangerous schemes.
-  //
-  // We match this behavior exactly:
-  // - All URLs pass validation, including javascript:, vbscript:, file:, data:
-  // - Images: renderer.rules.image shows alt text for non-data-image URLs
-  // - Links: DOMPurify strips dangerous href schemes, leaving safe anchor text
-  // - Blocking at validateLink would skip token generation entirely, causing raw
-  //   markdown source to appear instead of graceful fallbacks.
+  // Keep label tokens for invalid destinations; the rule below removes only the
+  // link wrapper so rejected Markdown stays readable without a false affordance.
   markdownParser.validateLink = () => true;
 
-  // Trim trailing CJK characters from auto-linked URLs (RFC 3986: raw CJK is
-  // not valid in URLs). markdown-it's built-in linkify for https:// URLs may
-  // swallow adjacent CJK text into the URL. This core rule runs after linkify
-  // and splits the CJK suffix back into a plain text token.
-  markdownParser.core.ruler.after("linkify", "linkify-cjk-trim", (state) => {
-    for (const blockToken of state.tokens) {
-      if (blockToken.type !== "inline" || !blockToken.children) {
-        continue;
-      }
-      const children = blockToken.children;
-      for (let index = children.length - 1; index >= 0; index--) {
-        const token = children[index];
-        if (!token || token.type !== "link_open") {
-          continue;
-        }
-        // Only trim linkify-generated autolinks, not explicit markdown links
-        // like [OpenClaw中文](https://docs.openclaw.ai) where CJK in display
-        // text is intentional and href must not be rewritten.
-        if (token.markup !== "linkify") {
-          continue;
-        }
-        // Use the display text to find CJK boundary (href may be percent-encoded)
-        const textToken = children[index + 1];
-        if (!textToken || textToken.type !== "text") {
-          continue;
-        }
-        const displayText = textToken.content;
-        // Scan backward to find trailing CJK suffix only.
-        // Middle CJK must be preserved (e.g. https://example.com/你/test stays intact);
-        // only strip a contiguous CJK tail adjacent to non-URL text.
-        let cjkIndex = displayText.length;
-        while (cjkIndex > 0 && CJK_RE.test(displayText.charAt(cjkIndex - 1))) {
-          cjkIndex--;
-        }
-        if (cjkIndex <= 0 || cjkIndex === displayText.length) {
-          continue;
-        }
-        // Split: URL part and CJK tail from display text
-        const trimmedDisplay = displayText.slice(0, cjkIndex);
-        const cjkTail = displayText.slice(cjkIndex);
-        // Rebuild href by preserving the scheme prefix that linkify added but
-        // display text omits (e.g. "mailto:" for emails, "http://" for www links).
-        const href = token.attrGet("href") ?? "";
-        const prefixLength = href.indexOf(displayText);
-        const hrefPrefix = prefixLength > 0 ? href.slice(0, prefixLength) : "";
-        token.attrSet("href", hrefPrefix + trimmedDisplay);
-        textToken.content = trimmedDisplay;
-        // Find link_close and insert CJK text after it
-        for (let closeIndex = index + 1; closeIndex < children.length; closeIndex++) {
-          if (children[closeIndex]?.type === "link_close") {
-            const tailToken = new state.Token("text", "", 0);
-            tailToken.content = cjkTail;
-            children.splice(closeIndex + 1, 0, tailToken);
-            break;
-          }
-        }
-      }
-    }
-  });
-
   markdownParser.core.ruler.after("linkify", "file-links", (state) => {
-    const env = state.env as Partial<MarkdownRenderEnv> | undefined;
-    if (env?.fileLinks !== true) {
-      return;
-    }
-    for (const blockToken of state.tokens) {
-      if (blockToken.type !== "inline" || !blockToken.children) {
-        continue;
-      }
-      const children = blockToken.children;
-      let linkDepth = 0;
+    const env = state.env as Partial<MarkdownRenderEnv>;
+    const decorations: MarkdownFileLinkDecoration[] = [];
+    const fileLinkTokens = (
+      label: Token,
+      target: { path: string; line: number | null },
+      reference: string,
+    ): Token[] => {
+      const open = new state.Token("link_open", "a", 1);
+      const close = new state.Token("link_close", "a", -1);
+      open.markup = "file-link";
+      close.markup = "file-link";
+      decorateFileLink(open, target);
+      decorations.push({
+        path: target.path,
+        reference,
+        applyLabel: (text) => {
+          label.content = text;
+          if (text !== reference) {
+            open.attrSet("title", reference);
+          }
+        },
+      });
+      return [open, label, close];
+    };
+    for (const children of markdownInlineChildren(state.tokens)) {
+      // Markdown links cannot nest; the opening token owns both wrapper states.
+      let openLink: Token | undefined;
       for (let index = 0; index < children.length; index++) {
         const token = children[index];
         if (!token) {
           continue;
         }
         if (token.type === "link_open") {
-          const href = token.attrGet("href");
-          if (href) {
+          const href = String(token.attrGet("href") ?? "");
+          if (
+            href &&
+            (env.fileLinks || env.documentFileLinks) &&
+            !token.attrGet("data-session-href") &&
+            !token.attrGet("data-template-package")
+          ) {
             let decodedHref = href;
             try {
               decodedHref = decodeURIComponent(href);
             } catch {
               // Keep the raw href when malformed percent escapes cannot be decoded.
             }
-            if (!decodedHref.includes("://")) {
+            // Query values may contain URLs; selection parsing owns the destination's scheme check.
+            if (env.documentFileLinks === "select" || !decodedHref.includes("://")) {
+              const documentTarget = env.documentFileLinks
+                ? parseMarkdownDocumentFileLinkTarget(
+                    href,
+                    env.documentFileLinks === "select" ? "select" : "read",
+                  )
+                : null;
               const target =
-                parseMarkdownFileLinkTarget(decodedHref) ??
-                (isHostLocalMarkdownFileHref(decodedHref)
-                  ? splitMarkdownFileLineSuffix(decodedHref.trim())
+                documentTarget ??
+                (env.fileLinks
+                  ? (parseMarkdownFileLinkTarget(decodedHref, { authored: true }) ??
+                    (isHostLocalMarkdownFileHref(decodedHref)
+                      ? splitMarkdownFileLineSuffix(decodedHref.trim())
+                      : null))
                   : null);
               if (target) {
                 token.attrs = token.attrs?.filter(([name]) => name !== "href") ?? null;
-                token.attrJoin("class", "markdown-file-link");
-                token.attrSet("role", "button");
-                token.attrSet("tabindex", "0");
-                token.attrSet("data-file-path", target.path);
-                if (target.line !== null) {
-                  token.attrSet("data-file-line", String(target.line));
+                decorateFileLink(token, target);
+                if (documentTarget) {
+                  token.attrSet("data-file-document-relative", "true");
+                }
+                // Keep authored labels; expose their reference only when different.
+                const reference = decodedHref.trim();
+                if (linkLabelText(children, index) !== reference) {
+                  token.attrSet("title", reference);
                 }
               }
             }
           }
-          linkDepth += 1;
+          // Local file decoration removes hrefs such as C:/notes.md before scheme rejection.
+          token.hidden = DISALLOWED_LINK_SCHEME_RE.test(String(token.attrGet("href") ?? ""));
+          openLink = token;
           continue;
         }
         if (token.type === "link_close") {
-          linkDepth = Math.max(0, linkDepth - 1);
+          token.hidden = openLink?.hidden ?? false;
+          openLink = undefined;
           continue;
         }
-        if (linkDepth > 0 || token.type !== "text") {
+        if (openLink || !env.fileLinks) {
+          continue;
+        }
+        if (token.type === "code_inline") {
+          const target = parseMarkdownFileLinkTarget(token.content);
+          if (target) {
+            children.splice(index, 1, ...fileLinkTokens(token, target, token.content.trim()));
+            index += 2;
+          }
+          continue;
+        }
+        // Prose references need a path separator or a bare filename's :line suffix.
+        if (token.type !== "text" || !FILE_REFERENCE_MARKER_RE.test(token.content)) {
           continue;
         }
 
-        const replacements: typeof children = [];
-        let cursor = 0;
         MARKDOWN_FILE_LINK_SCAN_RE.lastIndex = 0;
-        for (const match of token.content.matchAll(MARKDOWN_FILE_LINK_SCAN_RE)) {
-          const matchIndex = match.index;
-          const matched = match[0];
-          const matchEnd = matchIndex + matched.length;
-          if (
-            !isFileLinkBoundaryBefore(token.content, matchIndex) ||
-            !isFileLinkBoundaryAfter(token.content, matchEnd)
-          ) {
-            continue;
+        index = replaceMarkdownTextMatches(
+          state,
+          children,
+          index,
+          MARKDOWN_FILE_LINK_SCAN_RE,
+          (match) => {
+            const matchIndex = match.index;
+            const matched = match[0];
+            const matchEnd = matchIndex + matched.length;
+            if (!hasMarkdownLinkBoundaries(token.content, matchIndex, matchEnd)) {
+              return null;
+            }
+            const target = parseMarkdownFileLinkTarget(matched);
+            if (!target) {
+              return null;
+            }
+            const label = new state.Token("text", "", 0);
+            return fileLinkTokens(label, target, matched);
+          },
+        );
+      }
+    }
+    // Colliding basenames retain enough trailing path segments to stay distinct.
+    const labels = shortestFileLabels(decorations.map((decoration) => decoration.path));
+    for (const decoration of decorations) {
+      const label = labels.get(decoration.path) ?? decoration.path;
+      // Line suffixes stay on the shortened label.
+      decoration.applyLabel(label + decoration.reference.slice(decoration.path.length));
+    }
+  });
+
+  installMarkdownSessionLinks(markdownParser);
+
+  // One link pass owns URL labels and source-footer labels alike.
+  markdownParser.core.ruler.after("linkify", "web-link-classes", (state) => {
+    const paragraph = state.tokens.at(-3);
+    const tail = state.tokens.at(-2);
+    for (const children of markdownInlineChildren(state.tokens)) {
+      let footer =
+        state.env.mode === "message" &&
+        !state.env.streamingPrefix &&
+        paragraph?.type === "paragraph_open" &&
+        paragraph.level === 0 &&
+        tail?.children === children;
+      const links = [];
+      const repositories = new Set<string>();
+      let items = 0;
+      for (let index = 0; index < children.length; index++) {
+        let open = children[index]!;
+        if (open.type === "code_inline") {
+          // URL parsing absorbs whitespace/control characters; reject mixed prose first.
+          const content = open.content;
+          const url = CODE_SPAN_URL_BREAK_RE.test(content) ? null : parseWebLinkHref(content);
+          if (url && isGitHubHost(url.hostname)) {
+            const label = new state.Token("text", "", 0);
+            label.content = content;
+            open = new state.Token("link_open", "a", 1);
+            open.markup = "autolink";
+            open.attrSet("href", content);
+            children.splice(index, 1, open, label, new state.Token("link_close", "a", -1));
           }
-          const target = parseMarkdownFileLinkTarget(matched);
-          if (!target) {
-            continue;
-          }
-          if (matchIndex > cursor) {
-            const leading = new state.Token("text", "", 0);
-            leading.content = token.content.slice(cursor, matchIndex);
-            replacements.push(leading);
-          }
-          const open = new state.Token("link_open", "a", 1);
-          open.markup = "file-link";
-          open.attrSet("class", "markdown-file-link");
-          open.attrSet("role", "button");
-          open.attrSet("tabindex", "0");
-          open.attrSet("data-file-path", target.path);
-          if (target.line !== null) {
-            open.attrSet("data-file-line", String(target.line));
-          }
-          const label = new state.Token("text", "", 0);
-          label.content = matched;
-          const close = new state.Token("link_close", "a", -1);
-          close.markup = "file-link";
-          replacements.push(open, label, close);
-          cursor = matchEnd;
         }
-        if (replacements.length === 0) {
+        if (open.type !== "link_open") {
+          footer &&=
+            open.type === "softbreak" ||
+            open.type === "hardbreak" ||
+            (open.type === "text" && /^[\s,·]*$/u.test(open.content));
           continue;
         }
-        if (cursor < token.content.length) {
-          const trailing = new state.Token("text", "", 0);
-          trailing.content = token.content.slice(cursor);
-          replacements.push(trailing);
+        let end = index + 1;
+        let label: Token | undefined;
+        while (children[end]!.type !== "link_close") {
+          const token = children[end]!;
+          footer &&= token.type !== "image";
+          if (
+            !label &&
+            (token.type === "text" || token.type === "code_inline") &&
+            token.content.trim()
+          ) {
+            label = token;
+          }
+          end++;
         }
-        children.splice(index, 1, ...replacements);
-        index += replacements.length - 1;
+        const href = String(open.attrGet("href") ?? "");
+        const url = parseWebLinkHref(href);
+        const github = url && isGitHubHost(url.hostname);
+        if (url && !github && label && state.env.linkFavicons) {
+          const favicon = new state.Token("link_favicon", "img", 0);
+          favicon.meta = { hostname: url.hostname };
+          children.splice(index + 1, 0, favicon);
+          end++;
+        }
+        const content = children.slice(index, end + 1);
+        footer &&= Boolean(url);
+        if (url) {
+          const item = github ? parseGitHubItemPath(url) : null;
+          links.push({ content, url, label, item });
+          if (item && url.href.startsWith("https://github.com/")) {
+            items++;
+            repositories.add(`${item.owner}/${item.repo}`.toLowerCase());
+          }
+        }
+        index = end;
+      }
+      footer &&= items >= 2;
+      if (footer) {
+        children.length = 0;
+      }
+      const comma = new state.Token("text", "", 0);
+      comma.content = ", ";
+      for (const { content, url, item, label } of links) {
+        const open = content[0]!;
+        const github = isGitHubHost(url.hostname);
+        const generated = ["linkify", "autolink"].includes(open.markup);
+        if (generated) {
+          open.attrJoin("class", BARE_URL_CLASS);
+        }
+        const preview = item && url.href.startsWith("https://github.com/");
+        const compact = footer && links.length >= 5 && preview;
+        if (github && label) {
+          open.attrJoin("class", GITHUB_LINK_CLASS);
+          const reference = item ? formatGitHubItemReference(item) : "";
+          const chip =
+            item &&
+            (compact ||
+              generated ||
+              (content.length === 3 &&
+                label.type === "text" &&
+                [`#${item.number}`, reference].includes(label.content)));
+          if (chip) {
+            open.attrJoin("class", "markdown-github-item");
+            open.attrSet("data-github-kind", item.kind);
+            if (compact) {
+              const title = content.map((token) => token.content).join("");
+              label.type = "text";
+              label.tag = "";
+              content.splice(1, content.length - 2, label);
+              label.content = repositories.size === 1 ? `#${item.number}` : reference;
+              open.attrSet("aria-label", `${label.content}: ${title}`);
+            } else {
+              label.content = reference;
+            }
+          } else if (generated) {
+            label.content = formatGitHubLinkLabel(url);
+          }
+          if (!preview && (generated || chip)) {
+            open.attrSet("title", String(open.attrGet("href")));
+          }
+        }
+        if (footer) {
+          if (children.length) {
+            children.push(comma);
+          }
+          children.push(...content);
+        }
+      }
+      // Keep CJK trimming after URL labeling, before session/file decoration.
+      for (let index = 0; index < children.length; index++) {
+        const token = children[index]!;
+        // Linkify emits open/text/close triples; authored links are not normalized.
+        if (token.type !== "link_open" || token.markup !== "linkify") {
+          continue;
+        }
+        const textToken = children[index + 1]!;
+        const displayText = textToken.content;
+        let end = displayText.length;
+        while (end > 0 && CJK_CHARACTER_RE.test(displayText[end - 1]!)) {
+          end--;
+        }
+        if (end === 0 || end === displayText.length) {
+          continue;
+        }
+        const trimmed = displayText.slice(0, end);
+        const href = String(token.attrGet("href") ?? "");
+        const prefix = href.indexOf(displayText);
+        token.attrSet("href", (prefix > 0 ? href.slice(0, prefix) : "") + trimmed);
+        textToken.content = trimmed;
+        const suffixToken = new state.Token("text", "", 0);
+        suffixToken.content = displayText.slice(end);
+        children.splice(index + 3, 0, suffixToken);
       }
     }
   });
 
-  // Enable GFM task list checkboxes (- [x] / - [ ]).
-  // enabled: false keeps checkboxes read-only (disabled="") — task lists in
-  // chat messages are display-only, not interactive forms.
-  // label: false avoids wrapping item text in <label>, which would break
-  // accessibility when the item contains links (MDN warns against anchors inside labels).
-  markdownParser.use(markdownItTaskLists, { enabled: false, label: false });
+  installMarkdownGitHubRefs(markdownParser);
 
-  // The plugin inserts its checkbox as the first inline child. Trust only that
-  // generated token so later user-authored HTML remains escaped.
-  markdownParser.core.ruler.after("github-task-lists", "task-list-allowlist", (state) => {
-    for (const [index, listItem] of state.tokens.entries()) {
-      if (listItem.type !== "list_item_open" || listItem.attrGet("class") !== "task-list-item") {
+  markdownParser.core.ruler.after("inline", "task-lists", (state) => {
+    for (const [index, inline] of state.tokens.entries()) {
+      const listItem = state.tokens[index - 2];
+      const children = inline.children;
+      const firstChild = children?.[0];
+      if (
+        inline.type !== "inline" ||
+        state.tokens[index - 1]?.type !== "paragraph_open" ||
+        listItem?.type !== "list_item_open" ||
+        !/^\[[ xX]\] /.test(inline.content) ||
+        !children ||
+        !firstChild
+      ) {
         continue;
       }
-      const checkbox = state.tokens[index + 2]?.children?.[0];
-      if (checkbox?.type === "html_inline") {
-        checkbox.meta = { taskListPlugin: true };
+      // Task lists are display-only; labels would also wrap any links in the item.
+      const checkbox = new state.Token("html_inline", "", 0);
+      const checked = inline.content[1] !== " " ? ' checked=""' : "";
+      checkbox.content = `<input class="task-list-item-checkbox"${checked} disabled="" type="checkbox">`;
+      // Trust only the generated checkbox, including for transcript-role projection.
+      checkbox.meta = { taskListPlugin: true };
+      firstChild.content = firstChild.content.slice(3);
+      children.unshift(checkbox);
+      inline.content = inline.content.slice(3);
+      listItem.attrSet("class", "task-list-item");
+      for (let parent = index - 3; parent >= 0; parent--) {
+        const token = state.tokens[parent];
+        if (token?.level === listItem.level - 1) {
+          token.attrSet("class", "contains-task-list");
+          break;
+        }
       }
     }
   });
 
-  // Override html_block and html_inline to escape raw HTML (#13937).
-  // Exception: html_inline tokens marked by a trusted plugin (meta.taskListPlugin)
-  // are allowed through — they are generated by our own plugin pipeline, not user input,
-  // and DOMPurify provides the final safety net regardless.
-  // Renderer rules degrade to empty output on impossible token misses instead of
-  // throwing mid-render; markdown input is untrusted and the chat view must not crash.
-  markdownParser.renderer.rules.html_block = (tokens, index) => {
-    const token = tokens[index];
-    return token ? escapeMarkdownHtml(token.content) + "\n" : "";
-  };
-  markdownParser.renderer.rules.html_inline = (tokens, index) => {
+  // Override html_block and html_inline to escape raw HTML (#13937). Progress-card
+  // rendering strips non-progress HTML instead of exposing escaped tag text.
+  // Only generated task-list checkboxes bypass escaping; DOMPurify still sanitizes them.
+  markdownParser.renderer.rules.html_block = (tokens, index, _options, env) =>
+    renderRawMarkdownHtml(tokens, index, env?.progressBars === true, true);
+  markdownParser.renderer.rules.html_inline = (tokens, index, _options, env) => {
     const token = tokens[index];
     return token?.meta?.taskListPlugin === true
       ? token.content
-      : escapeMarkdownHtml(token?.content ?? "");
+      : renderRawMarkdownHtml(tokens, index, env?.progressBars === true, false);
   };
-  markdownParser.renderer.rules.code_inline = (tokens, index, options, env, self) => {
-    const rendered = defaultCodeInlineRenderer(tokens, index, options, env, self);
-    const renderEnv = env as Partial<MarkdownRenderEnv> | undefined;
-    const token = tokens[index];
-    const target =
-      token && renderEnv?.fileLinks === true ? parseMarkdownFileLinkTarget(token.content) : null;
-    if (!target) {
-      return rendered;
-    }
-    const lineAttribute =
-      target.line === null ? "" : ` data-file-line="${escapeMarkdownHtml(String(target.line))}"`;
-    return `<a class="markdown-file-link" role="button" tabindex="0" data-file-path="${escapeMarkdownHtml(target.path)}"${lineAttribute}>${rendered}</a>`;
+  markdownParser.renderer.rules.link_favicon = (tokens, index) => {
+    const hostname: unknown = tokens[index]?.meta?.hostname;
+    return typeof hostname === "string"
+      ? `<img class="markdown-link-favicon" data-link-favicon-host="${escapeHtml(hostname)}" width="16" height="16" loading="lazy" decoding="async" alt="" role="presentation">`
+      : "";
   };
-
-  // Override image to only allow base64 data URIs (#15437).
-  installAssistantTranscriptRoleImageRenderer(markdownParser, {
-    escapeHtml: escapeMarkdownHtml,
-    isInlineDataImage: (src) => INLINE_DATA_IMAGE_RE.test(src),
-    normalizeLabel: normalizeMarkdownImageLabel,
-    assistantLabel: () => t("sessionsView.assistant"),
-    openImageLabel: (alt, hasAlt) =>
-      t("chat.imageLightbox.open", {
-        title: hasAlt ? alt : t("chat.imageLightbox.untitled"),
-      }),
-    interactiveImages: (env) =>
-      (env as Partial<MarkdownRenderEnv> | undefined)?.interactiveImages === true,
-  });
-
-  // Override fenced code blocks with copy button + JSON collapse
-  markdownParser.renderer.rules.fence = (tokens, index, _options, env) => {
+  // Fenced and indented blocks share one interaction and overflow surface.
+  markdownParser.renderer.rules.fence = markdownParser.renderer.rules.code_block = (
+    tokens,
+    index,
+    _options,
+    env,
+  ) => {
     const token = tokens[index];
     if (!token) {
       return "";
     }
-    // token.info contains the full fence info string (e.g., "json title=foo");
-    // extract only the first whitespace-separated token as the language.
-    const language = token.info.trim().split(/\s+/)[0] || "";
-    return renderMarkdownCodeBlock(token.content, language, env, {
+    const fenced = token.type === "fence";
+    const language = fenced ? token.info.trim().split(/\s+/)[0] || "" : "";
+    // An unfinished fence consumes the remaining input; only container closers can
+    // follow it. Invalid fence-looking prose must not de-highlight an earlier block.
+    const openFence =
+      fenced &&
+      env?.streamingOpenFence === true &&
+      tokens.findLastIndex(({ nesting }) => nesting !== -1) === index;
+    const code = renderMarkdownCodeBlock(token.content, language, env, {
       copyText: markdownCodeBlockCopyText(token.content),
+      highlight: !openFence,
     });
+    // Keep source readable until the host mounts the lazy renderer. Incomplete
+    // streamed fences stay code so partial syntax never starts diagram layout.
+    return language.toLowerCase() === "mermaid" && !openFence
+      ? `<div class="markdown-mermaid">${code}</div>`
+      : code;
   };
-  // Override indented code blocks (code_block) with the same treatment as fence
-  markdownParser.renderer.rules.code_block = (tokens, index, _options, env) => {
-    const content = tokens[index]?.content;
-    if (content === undefined) {
-      return "";
+  installMarkdownHumanMentions(markdownParser);
+  // Link owners run first; preserve reference metadata before text tokens are joined.
+  markdownParser.core.ruler.before("text_join", "hex-colors", (state) => {
+    if (state.env.mode !== "message") {
+      return;
     }
-    return renderMarkdownCodeBlock(content, "", env, {
-      copyText: markdownCodeBlockCopyText(content),
-    });
+    for (const children of markdownInlineChildren(state.tokens)) {
+      let linkDepth = 0;
+      for (let index = 0; index < children.length; index += 1) {
+        const token = children[index]!;
+        if (token.type === "link_open" || token.type === "link_close") {
+          linkDepth += token.nesting;
+        }
+        if (
+          token.type !== "text" ||
+          token.meta?.githubItemReference ||
+          linkDepth !== 0 ||
+          !token.content.includes("#")
+        ) {
+          continue;
+        }
+        index = replaceMarkdownTextMatches(state, children, index, HEX_COLOR_RE, (match) => {
+          const end = match.index + match[0].length;
+          if (
+            !hasMarkdownLinkBoundaries(token.content, match.index, end) ||
+            /^[.-]\w/u.test(token.content.slice(end))
+          ) {
+            return null;
+          }
+          const color = new state.Token("hex_color", "", 0);
+          color.content = match[0];
+          return [color];
+        });
+      }
+    }
+  });
+  markdownParser.renderer.rules.hex_color = (tokens, index) => {
+    const color = tokens[index]!.content;
+    // Only the validated hex token enters this image; no style or HTML allowlist expansion.
+    const image = encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path fill="${color}" d="M0 0h16v16H0z"/></svg>`,
+    );
+    return `<span class="markdown-hex-color"><img class="markdown-hex-color__swatch" src="data:image/svg+xml,${image}" alt="" aria-hidden="true">${color}</span>`;
   };
-
   return markdownParser;
 }

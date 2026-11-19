@@ -19,12 +19,13 @@ Use this skill for `qa-lab` / `qa-channel` work. Repo-local QA only.
 
 ## Model policy
 
-- Live OpenAI lane: `openai/gpt-5.4`
-- Fast mode: on
-- Do not use:
-  - `openai/gpt-5.4-pro`
-  - `openai/gpt-5.4-mini`
-- Only change model policy if the user explicitly asks.
+- Normal live suite runs rely on QA Lab source- and auth-aware defaults.
+- Do not pass `--model`, `--alt-model`, or `--fast` by default. Omitted
+  `--fast` does not mean fast is disabled; fast behavior is source-owned.
+- For scenario-specific runs, the complete `execution.summary` is authoritative
+  and overrides generic default guidance, including when it requires other
+  flags. Add explicit provider/model pins only when
+  `execution.config.requiredProvider` or `requiredModel` requires them.
 
 ## Default workflow
 
@@ -32,14 +33,11 @@ Use this skill for `qa-lab` / `qa-channel` work. Repo-local QA only.
 2. Decide lane:
    - mock/dev: `mock-openai`
    - real validation: `live-frontier`
-3. For live OpenAI, use:
+3. For a normal live suite, use:
 
 ```bash
-OPENCLAW_LIVE_OPENAI_KEY="${OPENAI_API_KEY}" \
 pnpm openclaw qa suite \
   --provider-mode live-frontier \
-  --model openai/gpt-5.4 \
-  --alt-model openai/gpt-5.4 \
   --output-dir .artifacts/qa-e2e/run-all-live-frontier-<tag>
 ```
 
@@ -71,60 +69,34 @@ Langfuse, or external collector credentials.
 op account list
 ```
 
-- Direct Telegram npm live test secrets currently live in 1Password item:
-  - vault: `OpenClaw`
-  - item: `Telegram E2E`
-- That item is the first place to look for:
-  - `OPENCLAW_QA_TELEGRAM_DRIVER_BOT_TOKEN`
-  - `OPENCLAW_QA_TELEGRAM_SUT_BOT_TOKEN`
-  - `OPENCLAW_QA_PROVIDER_MODE`
-  - `OPENCLAW_NPM_TELEGRAM_PACKAGE_SPEC`
-- Convex QA secrets currently live in 1Password items:
-  - vault: `OpenClaw`
-  - item: `OPENCLAW_QA_CONVEX_SITE_URL`
-  - item: `OPENCLAW_QA_CONVEX_SECRET_MAINTAINER`
-  - item: `OPENCLAW_QA_CONVEX_SECRET_CI`
-- Additional related notes/login items seen during QA credential work:
-  - vault: `Private`
-  - items: `OPENCLAW QA`, `Convex`, `Telegram`
-- If a required value is missing from those notes:
-  - do not guess
-  - ask the maintainer/operator for the current value or the current 1Password item name
-  - for Telegram direct runs, `OPENCLAW_QA_TELEGRAM_GROUP_ID` may be stored separately from `Telegram E2E`
-  - for Convex runs, the leased Telegram credential should provide the Telegram group id and bot tokens together; do not require a separate `OPENCLAW_QA_TELEGRAM_GROUP_ID`
-  - for Convex runs, prefer `OpenClaw/OPENCLAW_QA_CONVEX_SITE_URL`; if that is stale or unclear, ask for the active pool URL before running
-- Prefer direct Telegram envs for the npm Telegram Docker lane when available:
+- Resolve approved 1Password item and field references for:
+  - `OPENCLAW_QA_CONVEX_SITE_URL`
+  - `OPENCLAW_QA_CONVEX_SECRET_MAINTAINER` for the maintainer role
+  - `OPENCLAW_QA_CONVEX_SECRET_CI` for the CI role
+- If a required reference is missing or stale, ask the maintainer/operator for its current item and field reference.
+  Do not ask for secret values in chat or copy them into logs or proof artifacts.
+- The npm Telegram Docker lane requires Convex credential leasing.
+  The lease supplies the Test Server SUT bot, QA-user authorization, and test-group metadata
+  defined by [Telegram E2E userbot](../telegram-e2e-userbot/SKILL.md).
+  Direct Telegram token variables do not replace the required Convex configuration.
+- Load the approved site URL and role-specific secret into the command's environment through the approved secret source.
+  The preflight requires the site URL and matching role secret before the Docker run.
+- With the maintainer configuration loaded, run:
 
 ```bash
-OPENCLAW_QA_TELEGRAM_GROUP_ID="..." \
-OPENCLAW_QA_TELEGRAM_DRIVER_BOT_TOKEN="..." \
-OPENCLAW_QA_TELEGRAM_SUT_BOT_TOKEN="..." \
-OPENCLAW_QA_PROVIDER_MODE="mock-openai" \
+OPENCLAW_NPM_TELEGRAM_CREDENTIAL_SOURCE=convex \
+OPENCLAW_NPM_TELEGRAM_CREDENTIAL_ROLE=maintainer \
+OPENCLAW_NPM_TELEGRAM_PROVIDER_MODE=mock-openai \
 OPENCLAW_NPM_TELEGRAM_PACKAGE_SPEC="openclaw@beta" \
 pnpm test:docker:npm-telegram-live
 ```
 
-- Prefer Convex mode when the goal is stable shared QA infra:
-  - round-robin credential leasing
-  - thinner wrapper for channel-specific setup
-  - CLI/admin flows around the pooled credentials
-- Live npm Telegram Docker lane note:
-  - `scripts/e2e/npm-telegram-live-runner.ts` reads `OPENCLAW_NPM_TELEGRAM_PROVIDER_MODE`
-  - do not assume `OPENCLAW_QA_PROVIDER_MODE` is consumed by that wrapper
-  - if a 1Password note only gives `OPENCLAW_QA_PROVIDER_MODE`, map it explicitly to `OPENCLAW_NPM_TELEGRAM_PROVIDER_MODE` before running the Docker lane
-- Verified live shape:
-  - Convex mode can pass the real Docker lane without direct Telegram env vars
-  - leased Telegram payload includes the group id coupled to the driver/SUT tokens
-  - a real run of `pnpm test:docker:npm-telegram-live` passed with:
-    - `OPENCLAW_QA_CREDENTIAL_SOURCE=convex`
-    - `OPENCLAW_QA_CREDENTIAL_ROLE=maintainer`
-    - `OPENCLAW_QA_CONVEX_SITE_URL`
-    - `OPENCLAW_QA_CONVEX_SECRET_MAINTAINER`
-    - `OPENCLAW_NPM_TELEGRAM_PROVIDER_MODE=mock-openai`
-- If direct Telegram env is missing locally and `op signin` blocks, prefer dispatching the manual GitHub lane because the `qa-live-shared` environment already has Convex CI credentials:
+- `scripts/e2e/npm-telegram-live-runner.ts` reads `OPENCLAW_NPM_TELEGRAM_PROVIDER_MODE`, not `OPENCLAW_QA_PROVIDER_MODE`.
+- For authorized hosted proof, use the existing manual lane when its `qa-live-shared` environment has valid Convex CI configuration.
+  A dispatch does not provision credentials or bypass a credential refusal.
 
 ```bash
-gh workflow run "NPM Telegram Beta E2E" --repo openclaw/openclaw --ref main \
+ghx workflow run "NPM Telegram Beta E2E" --repo openclaw/openclaw --ref main \
   -f package_spec=openclaw@YYYY.M.D-beta.N \
   -f package_label=openclaw@YYYY.M.D-beta.N \
   -f provider_mode=mock-openai
@@ -156,28 +128,19 @@ Use `qa character-eval` for style/persona/vibe checks across multiple live model
 
 ```bash
 pnpm openclaw qa character-eval \
-  --model openai/gpt-5.4,thinking=xhigh \
-  --model openai/gpt-5.2,thinking=xhigh \
-  --model openai/gpt-5,thinking=xhigh \
-  --model anthropic/claude-opus-4-6,thinking=high \
-  --model anthropic/claude-sonnet-4-6,thinking=high \
-  --model zai/glm-5.1,thinking=high \
-  --model moonshot/kimi-k2.5,thinking=high \
-  --model google/gemini-3.1-pro-preview,thinking=high \
-  --judge-model openai/gpt-5.4,thinking=xhigh,fast \
-  --judge-model anthropic/claude-opus-4-6,thinking=high \
-  --concurrency 16 \
-  --judge-concurrency 16 \
   --output-dir .artifacts/qa-e2e/character-eval-<tag>
 ```
 
 - Runs local QA gateway child processes, not Docker.
-- Preferred model spec syntax is `provider/model,thinking=<level>[,fast|,no-fast|,fast=<bool>]` for both `--model` and `--judge-model`.
+- Packaged `pnpm build` omits QA Lab + qa-channel by design (source-checkout
+  only). To exercise `openclaw qa`/qa-channel from a built dist, build with
+  `OPENCLAW_BUILD_PRIVATE_QA=1 pnpm build` (emits `dist/plugin-sdk/qa-lab.js`,
+  `qa-runtime.js`, `dist/extensions/{qa-lab,qa-channel}`) or run via `pnpm dev`.
+- With no model flags, character eval uses its current source-defined candidate,
+  judge, thinking, and fast defaults.
+- Repeat `--model provider/model,thinking=<level>[,fast|,no-fast|,fast=<bool>]`
+  or `--judge-model ...` only to replace the corresponding inventory explicitly.
 - Do not add new examples with separate `--model-thinking`; keep that flag as legacy compatibility only.
-- Defaults to candidate models `openai/gpt-5.4`, `openai/gpt-5.2`, `openai/gpt-5`, `anthropic/claude-opus-4-6`, `anthropic/claude-sonnet-4-6`, `zai/glm-5.1`, `moonshot/kimi-k2.5`, and `google/gemini-3.1-pro-preview` when no `--model` is passed.
-- Candidate thinking defaults to `high`, with `xhigh` for OpenAI models that support it. Prefer inline `--model provider/model,thinking=<level>`; `--thinking <level>` and `--model-thinking <provider/model=level>` remain compatibility shims.
-- OpenAI candidate refs default to fast mode so priority processing is used where supported. Use inline `,fast`, `,no-fast`, or `,fast=false` for one model; use `--fast` only to force fast mode for every candidate.
-- Judges default to `openai/gpt-5.4,thinking=xhigh,fast` and `anthropic/claude-opus-4-6,thinking=high`.
 - Report includes judge ranking, run stats, durations, and full transcripts; do not include raw judge replies. Duration is benchmark context, not a grading signal.
 - Candidate and judge concurrency default to 16. Use `--concurrency <n>` and `--judge-concurrency <n>` to override when local gateways or provider limits need a gentler lane.
 - Scenario source is YAML-only under `qa/scenarios/`: use `index.yaml` and

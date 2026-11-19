@@ -1,10 +1,53 @@
 // Resolves the diff base for merge commits when first-parent comparison is requested.
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { requireOptionArgument } from "./arg-utils.runtime.mjs";
 
 const DEFAULT_GIT_OUTPUT_MAX_BUFFER = 16 * 1024 * 1024;
 
-/** Resolve the git base ref to use when diffing a merge head. */
+/**
+ * Resolve a commit without allowing Git's unnegotiated promisor fetch.
+ * @param {string} ref
+ * @param {string} [cwd]
+ * @returns {string}
+ */
+export function ensureGitCommit(ref, cwd = process.cwd()) {
+  /** @type {import("node:child_process").ExecFileSyncOptionsWithStringEncoding} */
+  const options = { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] };
+  /** @param {string} revision */
+  const local = (revision) =>
+    execFileSync("git", ["rev-parse", "--verify", "--end-of-options", revision], {
+      ...options,
+      env: { ...process.env, GIT_NO_LAZY_FETCH: "1" },
+    }).trim();
+  try {
+    return local(`${ref}^{commit}`);
+  } catch {
+    // A local ref can name an absent object even after its remote branch advances.
+    const object = local(ref);
+    execFileSync(
+      "git",
+      [
+        "fetch",
+        "--no-auto-maintenance",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--refmap=",
+        "--",
+        "origin",
+        object,
+      ],
+      options,
+    );
+    return local(`${object}^{commit}`);
+  }
+}
+
+/**
+ * Resolve the git base ref to use when diffing a merge head.
+ * @param {{base: string, head?: string, cwd?: string, maxBuffer?: number, preferFirstParent?: boolean}} params
+ * @returns {string}
+ */
 export function resolveMergeHeadDiffBase({
   base,
   head = "HEAD",
@@ -24,18 +67,19 @@ export function resolveMergeHeadDiffBase({
     return base;
   }
 
-  const firstParent = resolveCommit({ ref: parents[0], cwd, maxBuffer });
-  const explicitBase = resolveCommit({ ref: base, cwd, maxBuffer });
-  if (!firstParent || firstParent === explicitBase) {
-    return base;
-  }
-
-  return firstParent;
+  // The merge parent is authoritative. Resolving a stale base in a partial
+  // clone can fetch unrelated history even when its result is discarded.
+  return parents[0];
 }
 
+/**
+ * @param {{ref: string, cwd: string, maxBuffer: number}} params
+ * @returns {string[]}
+ */
 function listCommitParents({ ref, cwd, maxBuffer }) {
+  const commit = ensureGitCommit(ref, cwd);
   try {
-    const output = execFileSync("git", ["rev-list", "--parents", "-n", "1", ref], {
+    const output = execFileSync("git", ["rev-list", "--parents", "-n", "1", commit], {
       cwd,
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf8",
@@ -47,28 +91,11 @@ function listCommitParents({ ref, cwd, maxBuffer }) {
   }
 }
 
-function resolveCommit({ ref, cwd, maxBuffer }) {
-  try {
-    return execFileSync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
-      cwd,
-      stdio: ["ignore", "pipe", "ignore"],
-      encoding: "utf8",
-      maxBuffer,
-    }).trim();
-  } catch {
-    return "";
-  }
-}
-
-function readRefValue(argv, index, optionName) {
-  const value = argv[index + 1];
-  if (value === undefined || value === "" || value.startsWith("-")) {
-    throw new Error(`${optionName} requires a value`);
-  }
-  return value;
-}
-
-/** @internal Directly tested script implementation detail. */
+/**
+ * @internal Directly tested script implementation detail.
+ * @param {readonly string[]} argv
+ * @returns {{base: string, head: string, preferFirstParent: boolean}}
+ */
 export function parseArgs(argv) {
   const args = {
     base: "",
@@ -78,12 +105,12 @@ export function parseArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--base") {
-      args.base = readRefValue(argv, index, "--base");
+      args.base = requireOptionArgument(argv, index, "--base");
       index += 1;
       continue;
     }
     if (arg === "--head") {
-      args.head = readRefValue(argv, index, "--head");
+      args.head = requireOptionArgument(argv, index, "--head");
       index += 1;
       continue;
     }

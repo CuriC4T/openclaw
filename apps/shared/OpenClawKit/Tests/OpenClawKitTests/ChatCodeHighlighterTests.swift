@@ -86,8 +86,19 @@ struct ChatCodeHighlighterTests {
         #expect(tokens.contains(where: { $0.0 == .number && $0.1 == "3" }))
     }
 
-    @Test func `unknown language passes through unstyled`() {
-        let attributed = ChatCodeHighlighter.attributedCode("SELECT *", languageId: "sql")
+    @Test func `unicode numerals advance highlighting without changing source`() {
+        for numeral in ["①", "½", "١", "Ⅷ"] {
+            let code = "let value = \(numeral)"
+            let tokens = self.kinds(code, language: "swift")
+
+            #expect(tokens.map(\.1).joined().utf8.elementsEqual(code.utf8))
+            #expect(!tokens.map(\.1).contains(""))
+            #expect(tokens.contains(where: { $0.0 == .number && $0.1 == numeral }))
+        }
+    }
+
+    @Test @MainActor func `unknown language passes through unstyled`() {
+        let attributed = ChatCodeHighlightCache.highlighted(code: "SELECT *", languageId: "sql")
         #expect(String(attributed.characters) == "SELECT *")
         #expect(ChatCodeHighlighter.language(for: "sql") == nil)
     }
@@ -105,5 +116,32 @@ struct ChatCodeHighlighterTests {
         let highlighted = ChatCodeHighlightCache.highlighted(code: code, languageId: "swift")
         #expect(String(highlighted.characters) == code)
         #expect(!ChatCodeHighlighter.isWithinHighlightLimits(code))
+    }
+
+    @Test @MainActor func `cache pressure retains recently displayed highlights and evicts only one`() {
+        var storage = ChatCodeHighlightCache.Storage()
+        var builds = 0
+        func makeValue() -> AttributedString {
+            builds += 1
+            return AttributedString("highlighted")
+        }
+
+        for index in 0..<160 {
+            _ = storage.value(for: "swift\u{0}let value = \(index)", create: makeValue)
+        }
+        // The oldest insertion is still visible; another consumer adds a new block.
+        _ = storage.value(for: "swift\u{0}let value = 0", create: makeValue)
+        _ = storage.value(for: "swift\u{0}let value = 160", create: makeValue)
+        #expect(builds == 161)
+
+        _ = storage.value(for: "swift\u{0}let value = 0", create: makeValue)
+        for index in 2...160 {
+            _ = storage.value(for: "swift\u{0}let value = \(index)", create: makeValue)
+        }
+        #expect(builds == 161)
+
+        // The least recently used entry must be gone: retention remains bounded.
+        _ = storage.value(for: "swift\u{0}let value = 1", create: makeValue)
+        #expect(builds == 162)
     }
 }

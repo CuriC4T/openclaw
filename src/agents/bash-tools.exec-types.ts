@@ -1,37 +1,27 @@
-/**
- * Shared type contracts for bash exec tools.
- * Defines defaults, approval follow-up payloads, elevated policy defaults, and
- * tool result details consumed across exec hosts and process controls.
- */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { EventSessionRoutingPolicy } from "../infra/event-session-routing.js";
-import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
-import type {
-  ExecAsk,
-  ExecHost,
-  ExecMode,
-  ExecSecurity,
-  ExecTarget,
-} from "../infra/exec-approvals.js";
-import type { ExecAutoReviewer } from "../infra/exec-auto-review.js";
+import type { ExecAsk, ExecMode, ExecSecurity } from "../infra/exec-approvals.js";
+import type { ExecAutoReviewer, ExecAutoReviewTranscript } from "../infra/exec-auto-review.js";
 import type { SafeBinProfileFixture } from "../infra/exec-safe-bin-policy.js";
 import type { PluginHookChannelContext } from "../plugins/hook-types.js";
-import type { TerminationReason } from "../process/supervisor/types.js";
+import type { SecretStoreExecEnvironment } from "../secrets/store/secret-store.js";
+import type { OperationalRunInstanceRef } from "./admitted-run-context.js";
+import type { ExecApprovalFollowupOutcome } from "./bash-tools.exec-result.types.js";
+import type { ExecToolRoutingDefaults } from "./bash-tools.exec-routing.types.js";
 import type { BashSandboxConfig } from "./bash-tools.shared.js";
 import type { EmbeddedFullAccessBlockedReason } from "./embedded-agent-runner/types.js";
+import type { ExecApprovalTransport } from "./exec-approval-transport.js";
 import type { ExecReviewerConfig } from "./exec-auto-reviewer.js";
+import type { PreparedGitHubToolEnvironment } from "./github-tool-identity.types.js";
 
-/** Runtime defaults passed into exec/process tool factories. */
-export type ExecToolDefaults = {
+/** Restart notification policy captured only for a durable launch. */
+export type DurableExecOptions = { notifyOnExit: boolean; notifyOnExitEmptySuccess: boolean };
+
+export type ExecToolDefaults = ExecToolRoutingDefaults & {
   hasCronTool?: boolean;
-  host?: ExecTarget;
   mode?: ExecMode;
-  security?: ExecSecurity;
-  ask?: ExecAsk;
+  bypassHostApprovalFloors?: boolean;
   trigger?: string;
-  node?: string;
-  /** Default working directory for node-host execution only. */
-  nodeCwd?: string;
   pathPrepend?: string[];
   safeBins?: string[];
   strictInlineEval?: boolean;
@@ -40,9 +30,21 @@ export type ExecToolDefaults = {
   safeBinProfiles?: Record<string, SafeBinProfileFixture>;
   reviewer?: ExecReviewerConfig;
   config?: OpenClawConfig;
+  /** Host-prepared non-secret environment and store projection exclusions. */
+  preparedRunEnvironment?: PreparedGitHubToolEnvironment;
+  /** An explicit snapshot, including an empty one, replaces local store access. */
+  preparedStoreEnvironment?: Readonly<SecretStoreExecEnvironment>;
+  /** Host-prepared routing hint; remote workers have no Gateway session database. */
+  preparedSubagentExecution?: boolean;
   autoReviewer?: ExecAutoReviewer;
+  createApprovalTransport?: (toolCallId: string, signal?: AbortSignal) => ExecApprovalTransport;
+  /** Reads current attempt context only when a command needs review. */
+  reviewTranscript?: () => ExecAutoReviewTranscript | undefined;
   agentId?: string;
+  /** Credential owner when execution borrows another agent's tool policy. */
+  executionAgentId?: string;
   backgroundMs?: number;
+  cleanupMs?: number;
   timeoutSec?: number;
   approvalWarningText?: string;
   approvalFollowupText?: string;
@@ -50,12 +52,22 @@ export type ExecToolDefaults = {
   approvalFollowupMode?: "agent" | "direct";
   approvalRunningNoticeMs?: number;
   sandbox?: BashSandboxConfig;
+  /** Immutable session policy that forbids execution outside its provisioned sandbox. */
+  sandboxRequired?: boolean;
   elevated?: ExecElevatedDefaults;
   allowBackground?: boolean;
+  /** Final run-local availability of the process continuation tool. */
+  processToolAvailabilityRef?: { value?: boolean };
+  /** Final run-local availability of sessions_yield, the only way a one-shot run awaits an exit. */
+  sessionsYieldAvailabilityRef?: { value?: boolean };
   scopeKey?: string;
   sessionKey?: string;
+  /** Executing session when tool policy is borrowed from a different session. */
+  runSessionKey?: string;
   /** Stable agent run that owns any approval created by this tool. */
   runId?: string;
+  /** Exact admitted execution instance that owns secret-egress proxy access. */
+  operationalRunInstance?: OperationalRunInstanceRef;
   /** Durable session that receives detached exec completion events and approval followups. */
   notifySessionKey?: string;
   /** Ephemeral session UUID active when this exec tool was built. Regenerated
@@ -66,18 +78,16 @@ export type ExecToolDefaults = {
    *  exec approval followup path resolve the session key's current sessionId and
    *  drop the followup when the key was rebound by `/new` or `/reset`. */
   sessionStore?: string;
-  /** `session.mainKey` from the runtime config; passed through into
-   *  runExecProcess so background-exit notifications can remap cron-run
-   *  session keys to the agent's main queue without an ambient config load. */
+  /** @deprecated SDK declaration compatibility; coding-tool routing comes from config. */
   mainKey?: string;
-  /** `session.scope` from the runtime config; passed alongside `mainKey`
-   *  so the cron-run remap can route global-scope agents to the "global"
-   *  queue instead of agent-main. */
+  /** @deprecated SDK declaration compatibility; coding-tool routing comes from config. */
   sessionScope?: "per-sender" | "global";
   /** Start-time routing policy for detached exec system events. */
   eventRouting?: EventSessionRoutingPolicy;
   messageProvider?: string;
   currentChannelId?: string;
+  /** Conversation reply destination, including a thread created from the arrival channel. */
+  currentMessagingTarget?: string;
   currentThreadTs?: string;
   /** Channel-owned sender/chat metadata. Exec subprocesses receive only sender/chat IDs. */
   channelContext?: PluginHookChannelContext;
@@ -90,14 +100,43 @@ export type ExecToolDefaults = {
   cwd?: string;
 };
 
-/** Outcome passed to approval follow-up factories after approved async exec. */
-export type ExecApprovalFollowupOutcome = {
-  status: "completed" | "failed";
-  exitCode: number | null;
-  exitReason?: TerminationReason;
-  timedOut: boolean;
-  aggregated: string;
-  reason?: string;
+/** Request and approval context shared by Gateway and node execution hosts. */
+export type ExecHostCommandParams = {
+  approvalTransport?: ExecApprovalTransport;
+  command: string;
+  env: Record<string, string>;
+  requestedEnv?: Record<string, string>;
+  timeoutSec?: number;
+  defaultTimeoutSec: number;
+  security: ExecSecurity;
+  ask: ExecAsk;
+  bypassHostApprovalFloors?: boolean;
+  autoReview?: boolean;
+  autoReviewer?: ExecAutoReviewer;
+  signal?: AbortSignal;
+  strictInlineEval?: boolean;
+  commandHighlighting?: boolean;
+  trigger?: string;
+  agentId?: string;
+  sessionKey?: string;
+  toolCallId?: string;
+  /** Session UUID active when the approval was requested; pins the followup. */
+  sessionId?: string;
+  /** Session-store template, so the direct/denied followup can detect a rebind. */
+  sessionStore?: string;
+  bashElevated?: ExecElevatedDefaults;
+  approvalReviewerDeviceId?: string;
+  nonInteractiveApproval?: boolean;
+  turnSourceChannel?: string;
+  turnSourceTo?: string;
+  turnSourceAccountId?: string;
+  turnSourceThreadId?: string | number;
+  approvalFollowupMode?: "agent" | "direct";
+  warnings: string[];
+  notifySessionKey?: string;
+  approvalRunningNoticeMs: number;
+  processContinuationAvailable?: boolean;
+  trustedSafeBinDirs?: ReadonlySet<string>;
 };
 
 type ExecApprovalFollowupContext = {
@@ -121,60 +160,16 @@ export type ExecElevatedDefaults = {
   fullAccessBlockedReason?: EmbeddedFullAccessBlockedReason;
 };
 
-/** Structured details returned by exec tool calls. */
-export type ExecToolDetails =
-  | {
-      status: "running";
-      sessionId: string;
-      pid?: number;
-      startedAt: number;
-      cwd?: string;
-      tail?: string;
-    }
-  | {
-      status: "completed" | "failed";
-      exitCode: number | null;
-      exitSignal?: NodeJS.Signals | number | null;
-      failureKind?: string;
-      reason?: "not-dispatched" | "outcome-unknown";
-      nodeInvokeFailure?: {
-        failureCode?: string;
-        message: string;
-        nodeCommandDispatched?: boolean;
-        requestSent?: boolean;
-      };
-      exitReason?: TerminationReason;
-      durationMs: number;
-      aggregated: string;
-      timedOut?: boolean;
-      noOutputTimedOut?: boolean;
-      cwd?: string;
-    }
-  | {
-      status: "approval-pending";
-      approvalId: string;
-      approvalSlug: string;
-      expiresAtMs: number;
-      allowedDecisions?: readonly ExecApprovalDecision[];
-      host: ExecHost;
-      command: string;
-      cwd?: string;
-      nodeId?: string;
-      warningText?: string;
-    }
-  | {
-      status: "approval-unavailable";
-      reason:
-        | "initiating-platform-disabled"
-        | "initiating-platform-unsupported"
-        | "no-approval-route";
-      channel?: string;
-      channelLabel?: string;
-      accountId?: string;
-      sentApproverDms?: boolean;
-      host: ExecHost;
-      command: string;
-      cwd?: string;
-      nodeId?: string;
-      warningText?: string;
-    };
+export function cloneExecElevatedDefaults(value: ExecElevatedDefaults): ExecElevatedDefaults {
+  return {
+    enabled: value.enabled,
+    allowed: value.allowed,
+    defaultLevel: value.defaultLevel,
+    ...(value.fullAccessAvailable !== undefined
+      ? { fullAccessAvailable: value.fullAccessAvailable }
+      : {}),
+    ...(value.fullAccessBlockedReason !== undefined
+      ? { fullAccessBlockedReason: value.fullAccessBlockedReason }
+      : {}),
+  };
+}

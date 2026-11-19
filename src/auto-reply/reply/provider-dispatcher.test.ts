@@ -1,9 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import type {
-  ReplyDispatcherOptions,
-  ReplyDispatcherWithTypingOptions,
-} from "./reply-dispatcher.js";
+import type { DispatchReplyFromConfig } from "./dispatch-from-config.types.js";
+import type { ReplyDispatcherOptions } from "./reply-dispatcher.js";
+import type { ReplyDispatcherWithTypingOptions } from "./reply-dispatcher.types.js";
 
 type BufferedDispatchFn =
   typeof import("../dispatch.js").dispatchInboundMessageWithBufferedDispatcher;
@@ -21,7 +20,7 @@ vi.mock("../dispatch.js", () => ({
     hoisted.plainDispatchMock(...args),
 }));
 
-const { dispatchReplyWithBufferedBlockDispatcher, dispatchReplyWithDispatcher } =
+const { dispatchReplyWithBufferedBlockDispatcherCore, dispatchReplyWithDispatcherCore } =
   await import("./provider-dispatcher.js");
 
 const dispatchResult = {
@@ -36,16 +35,18 @@ describe("provider dispatcher wrappers", () => {
     hoisted.plainDispatchMock.mockResolvedValue(dispatchResult);
   });
 
-  it("forwards runtime toolsAllow through the buffered wrapper", async () => {
+  it("forwards allowed tools and the owning dispatcher through the buffered wrapper", async () => {
     const dispatcherOptions = {
       deliver: async () => ({ visibleReplySent: false }),
     } satisfies ReplyDispatcherWithTypingOptions;
+    const dispatchReplyFromConfig = vi.fn<DispatchReplyFromConfig>();
 
-    await dispatchReplyWithBufferedBlockDispatcher({
+    await dispatchReplyWithBufferedBlockDispatcherCore({
       ctx: { Body: "hello" },
       cfg: {} as OpenClawConfig,
       dispatcherOptions,
       toolsAllow: ["message"],
+      dispatchReplyFromConfig,
     });
 
     expect(hoisted.bufferedDispatchMock).toHaveBeenCalledTimes(1);
@@ -53,6 +54,7 @@ describe("provider dispatcher wrappers", () => {
       expect.objectContaining({
         dispatcherOptions,
         toolsAllow: ["message"],
+        dispatchReplyFromConfig,
       }),
     );
   });
@@ -62,7 +64,7 @@ describe("provider dispatcher wrappers", () => {
       deliver: async () => ({ visibleReplySent: false }),
     } satisfies ReplyDispatcherOptions;
 
-    await dispatchReplyWithDispatcher({
+    await dispatchReplyWithDispatcherCore({
       ctx: { Body: "hello" },
       cfg: {} as OpenClawConfig,
       dispatcherOptions,

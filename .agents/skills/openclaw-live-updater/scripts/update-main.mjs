@@ -3,9 +3,14 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
+  readSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -17,70 +22,457 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as defaultSleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS } from "../../../../gateway-shutdown-budget.mjs";
 import { detectChangedScope } from "../../../../scripts/ci-changed-scope.mjs";
 import { isDirectRunUrl } from "../../../../scripts/lib/direct-run.mjs";
 import {
   BUILD_STAMP_FILE,
   RUNTIME_POSTBUILD_STAMP_FILE,
-} from "../../../../scripts/lib/local-build-metadata.mjs";
+} from "../../../../scripts/lib/local-build-metadata.mts";
+import { runManagedCommand } from "../../../../scripts/lib/managed-child-process.mts";
 import {
   runNodeConfigFiles,
   runNodeSourceRoots,
-} from "../../../../scripts/run-node-watch-paths.mjs";
+} from "../../../../scripts/run-node-watch-paths.mts";
 import {
   resolveBuildRequirement,
   resolveRuntimePostBuildRequirement,
-} from "../../../../scripts/run-node.mjs";
+} from "../../../../scripts/run-node.mts";
+import { isGeneratedLaunchAgentEnvironmentWrapper } from "../../../../src/daemon/launchd-env-wrapper.js";
+import { resolveRuntimeScriptPosition } from "../../../../src/daemon/runtime-binary.js";
 
-const DEFAULT_CHECKOUT = "/Users/steipete/openclaw";
 const DEFAULT_EXPECTED_ORIGIN = "openclaw/openclaw";
 const FULL_SHA_RE = /^[0-9a-f]{40}$/u;
 const GATEWAY_READINESS_ATTEMPTS = 7;
 const GATEWAY_READINESS_RETRY_DELAY_MS = 5_000;
 const GATEWAY_CLI_TIMEOUT_MS = 30_000;
 const DEFAULT_LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS = 20;
-const MAX_LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS = 300;
 const LAUNCHD_TEARDOWN_MARGIN_MS = 15_000;
 const GATEWAY_STOP_PROOF_RETRY_DELAY_MS = 250;
 const GATEWAY_PROCESS_START_TIMEOUT_MS = 20_000;
 const GATEWAY_PROCESS_START_RETRY_DELAY_MS = 250;
 const GATEWAY_SUSPEND_TIMEOUT_MS = 10_000;
+const LEAF_COMMAND_TIMEOUT_MS = 30_000;
+const COMMAND_TIMEOUT_MS = Object.freeze({
+  dependencyInstall: 15 * 60_000,
+  gatewayBuild: 20 * 60_000,
+  gatewayProbe: GATEWAY_CLI_TIMEOUT_MS,
+  gatewayService: 60_000,
+  gitFetch: 5 * 60_000,
+  gitMerge: 2 * 60_000,
+  macAppRebuild: 30 * 60_000,
+});
 const GATEWAY_STARTUP_TRACE_ENV = "OPENCLAW_GATEWAY_STARTUP_TRACE";
 const SYSTEM_LAUNCH_DAEMON_DIR = "/Library/LaunchDaemons";
-const GENERATED_LAUNCH_AGENT_ENV_WRAPPER = `#!/bin/sh
-set -eu
-env_file="$1"
-shift
-if [ -f "$env_file" ]; then
-  . "$env_file"
-fi
-exec "$@"
-`;
+const MAX_FAILURE_DIAGNOSTIC_DEPTH = 4;
+const MAX_FAILURE_DIAGNOSTIC_MEMBERS = 8;
+const SAFE_INVARIANT_DETAIL_KEYS = [
+  "elapsedMs",
+  "exitTimeoutSeconds",
+  "listenerClosed",
+  "lockRetained",
+  "manualRecoveryRequired",
+  "phase",
+  "processExited",
+  "processTreeState",
+  "serviceBootedOut",
+  "serviceState",
+  "timeoutMs",
+];
+// CLI diagnostics stay typed and bounded because child-process errors can
+// retain argv, environment, and output that must never enter the JSON result.
+const aggregateDiagnosticMembers = new WeakMap();
 const DEPENDENCY_INPUT_RE =
   /^(?:\.npmrc$|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|patches\/)|(?:^|\/)package\.json$/u;
 
+/**
+ * @typedef {object} GatewayDeploymentRef
+ * @property {string} entrypoint
+ */
+
+/**
+ * The fields required when the updater invokes the managed Gateway CLI.
+ * LaunchAgent inspection returns a richer object, while focused probes may
+ * provide only this execution view.
+ *
+ * @typedef {object} GatewayCliDeploymentBase
+ * @property {string} configPath
+ * @property {string} entrypoint
+ * @property {string} executable
+ * @property {string[]} invocationPrefix
+ * @property {number} port
+ * @property {Record<string, string>} [serviceEnvironment]
+ * @property {string | null} [workingDirectory]
+ */
+
+/**
+ * @typedef {GatewayCliDeploymentBase & {
+ *   envFilePath?: null,
+ *   runtime?: string,
+ *   wrapperPath?: null,
+ * }} DirectGatewayCliDeployment
+ */
+
+/**
+ * @typedef {GatewayCliDeploymentBase & {
+ *   envFilePath: string,
+ *   runtime: string,
+ *   wrapperPath: string,
+ * }} WrappedGatewayCliDeployment
+ */
+
+/** @typedef {DirectGatewayCliDeployment | WrappedGatewayCliDeployment} GatewayCliDeployment */
+
+/**
+ * The stable identity fields used to verify a LaunchAgent retarget.
+ * Repointing deliberately does not require the execution-only fields above.
+ *
+ * @typedef {object} GatewayRepointDeployment
+ * @property {string} configPath
+ * @property {string} entrypoint
+ * @property {string} label
+ * @property {number} port
+ */
+
+/**
+ * The updater's established test/API result keeps owner details extensible,
+ * while naming the fields every completed maintenance run exposes.
+ *
+ * @typedef {Record<string, unknown> & {
+ *   actions: Record<string, unknown>,
+ *   buildBefore: Record<string, unknown>,
+ *   changedPaths?: string[],
+ *   macTarget?: Record<string, unknown>,
+ *   release?: () => void,
+ * }} UpdateResult
+ */
+
 class UpdateInvariantError extends Error {
-  constructor(code, message, details) {
-    super(message);
+  constructor(code, message, details, options) {
+    super(message, options);
     this.name = "UpdateInvariantError";
     this.code = code;
     this.details = details;
   }
 }
 
-/** Re-throw the original runtime value while exposing the Error contract to type-aware lint. */
+class UpdateCommandError extends Error {
+  constructor(operation, error) {
+    super(retainedErrorMessage(error), { cause: error });
+    this.name = "UpdateCommandError";
+    this.operation = operation;
+    const status = ownDataProperty(error, "status");
+    const signal = ownDataProperty(error, "signal");
+    if (Number.isInteger(status)) {
+      this.status = status;
+    }
+    if (typeof signal === "string" && /^SIG[A-Z0-9]+$/u.test(signal)) {
+      this.signal = signal;
+    }
+  }
+}
+
+/**
+ * Re-throw the original runtime value while exposing the Error contract to type-aware lint.
+ *
+ * @returns {never}
+ */
 function throwPreservingValue(value) {
   throw /** @type {Error} */ (value);
 }
 
-function aggregateErrorWithCause(errors, message, cause) {
-  return new AggregateError(errors, message, { cause });
+function ownDataProperty(value, key) {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    return undefined;
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function failureMessage(error) {
+  if (error instanceof Error) {
+    if (error instanceof UpdateCommandError) {
+      return `${error.operation} failed`;
+    }
+    const status = ownDataProperty(error, "status");
+    const signal = ownDataProperty(error, "signal");
+    if (
+      Number.isInteger(status) ||
+      (typeof signal === "string" && /^SIG[A-Z0-9]+$/u.test(signal))
+    ) {
+      return "external command failed";
+    }
+    const message = ownDataProperty(error, "message");
+    return typeof message === "string" ? message : error.name;
+  }
+  try {
+    return String(error);
+  } catch {
+    return "unknown updater failure";
+  }
+}
+
+function retainedErrorMessage(error) {
+  if (error instanceof Error) {
+    const message = ownDataProperty(error, "message");
+    return typeof message === "string" ? message : error.name;
+  }
+  try {
+    return String(error);
+  } catch {
+    return "unknown updater failure";
+  }
+}
+
+function aggregateErrorWithCause(members, message, cause) {
+  const error = new AggregateError(
+    members.map((member) => member.error),
+    message,
+    { cause },
+  );
+  aggregateDiagnosticMembers.set(error, members);
+  return error;
+}
+
+function gatewayCliOperation(args) {
+  if (args[0] === "gateway" && args[1] === "call") {
+    if (args[2] === "gateway.suspend.prepare") {
+      return "gateway.suspend.prepare";
+    }
+    if (args[2] === "gateway.suspend.resume") {
+      return "gateway.suspend.resume";
+    }
+    return "gateway.call";
+  }
+  if (args[0] === "gateway" && args[1] === "status") {
+    return "gateway.status";
+  }
+  if (args[0] === "health") {
+    return "gateway.health";
+  }
+  return "gateway.cli";
+}
+
+function isLegacyGatewaySuspendPrepareParamsError(error) {
+  if (
+    !(error instanceof UpdateCommandError) ||
+    error.operation !== "gateway.suspend.prepare" ||
+    error.status !== 1
+  ) {
+    return false;
+  }
+  const cause = ownDataProperty(error, "cause");
+  const stdout = ownDataProperty(cause, "stdout");
+  if (typeof stdout !== "string" || !stdout.trim()) {
+    return false;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(stdout.trim());
+  } catch {
+    return false;
+  }
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    Array.isArray(payload) ||
+    Object.keys(payload).length !== 2 ||
+    payload.ok !== false
+  ) {
+    return false;
+  }
+  const requestError = payload.error;
+  return (
+    typeof requestError === "object" &&
+    requestError !== null &&
+    !Array.isArray(requestError) &&
+    Object.keys(requestError).length === 4 &&
+    requestError.type === "gateway_request_error" &&
+    requestError.code === "INVALID_REQUEST" &&
+    requestError.message === "invalid gateway.suspend.prepare params" &&
+    requestError.retryable === false
+  );
+}
+
+async function runUpdateCommand(runCommand, operation, command, args, checkout, options) {
+  try {
+    return await runCommand(command, args, checkout, options);
+  } catch (error) {
+    if (
+      error instanceof UpdateInvariantError ||
+      error instanceof UpdateCommandError ||
+      error instanceof AggregateError
+    ) {
+      throw error;
+    }
+    throw new UpdateCommandError(operation, error);
+  }
+}
+
+function formatInvariantDetails(details) {
+  const formatted = {};
+  for (const key of SAFE_INVARIANT_DETAIL_KEYS) {
+    const value = ownDataProperty(details, key);
+    if (typeof value === "boolean") {
+      formatted[key] = value;
+    } else if (
+      ["elapsedMs", "exitTimeoutSeconds", "timeoutMs"].includes(key) &&
+      Number.isInteger(value)
+    ) {
+      formatted[key] = value;
+    } else if (key === "phase" && typeof value === "string") {
+      formatted[key] = value;
+    } else if (
+      key === "processTreeState" &&
+      ["indeterminate", "live", "terminated"].includes(value)
+    ) {
+      formatted[key] = value;
+    } else if (key === "serviceState" && ["running", "stopped", "stopping"].includes(value)) {
+      formatted[key] = value;
+    }
+  }
+  return Object.keys(formatted).length > 0 ? formatted : undefined;
+}
+
+function formatCommandDiagnostic(error, operation) {
+  const diagnostic = { kind: "command", operation };
+  const status = ownDataProperty(error, "status");
+  const signal = ownDataProperty(error, "signal");
+  if (Number.isInteger(status)) {
+    diagnostic.status = status;
+  }
+  if (typeof signal === "string" && /^SIG[A-Z0-9]+$/u.test(signal)) {
+    diagnostic.signal = signal;
+  }
+  return diagnostic;
+}
+
+function formatFailureDiagnostic(error, state, depth = 0) {
+  if (depth >= MAX_FAILURE_DIAGNOSTIC_DEPTH) {
+    return { kind: "truncated", reason: "depth_limit" };
+  }
+  if ((typeof error === "object" || typeof error === "function") && error !== null) {
+    if (state.seen.has(error)) {
+      return { kind: "truncated", reason: "cycle" };
+    }
+    state.seen.add(error);
+  }
+  if (error instanceof UpdateInvariantError) {
+    const details = formatInvariantDetails(error.details);
+    const cause = ownDataProperty(error, "cause");
+    return {
+      kind: "invariant",
+      code: error.code,
+      ...(details ? { details } : {}),
+      ...(cause === undefined ? {} : { cause: formatFailureDiagnostic(cause, state, depth + 1) }),
+    };
+  }
+  if (error instanceof UpdateCommandError) {
+    return formatCommandDiagnostic(error, error.operation);
+  }
+  if (error instanceof AggregateError) {
+    const rawErrors = ownDataProperty(error, "errors");
+    const errors = Array.isArray(rawErrors) ? rawErrors : [];
+    const members =
+      aggregateDiagnosticMembers.get(error) ??
+      errors.map((memberError, index) => ({
+        role: index === 0 ? "primary" : "secondary",
+        error: memberError,
+      }));
+    const limitedMembers = members.slice(0, MAX_FAILURE_DIAGNOSTIC_MEMBERS);
+    const diagnostic = {
+      kind: "aggregate",
+      members: limitedMembers.map((member) => ({
+        role: member.role,
+        error: formatFailureDiagnostic(member.error, state, depth + 1),
+      })),
+    };
+    const cause = ownDataProperty(error, "cause");
+    const causeMember = members.findIndex((member) => member.error === cause);
+    if (causeMember >= 0 && causeMember < limitedMembers.length) {
+      diagnostic.causeMember = causeMember;
+    }
+    if (members.length > limitedMembers.length) {
+      diagnostic.omittedMembers = members.length - limitedMembers.length;
+    }
+    return diagnostic;
+  }
+  const status = ownDataProperty(error, "status");
+  const signal = ownDataProperty(error, "signal");
+  if (Number.isInteger(status) || (typeof signal === "string" && /^SIG[A-Z0-9]+$/u.test(signal))) {
+    return formatCommandDiagnostic(error, "external_command");
+  }
+  return { kind: error instanceof Error ? "error" : "thrown_value" };
+}
+
+export function formatUpdateFailure(error) {
+  const code = error instanceof UpdateInvariantError ? error.code : "update_failed";
+  const message = failureMessage(error);
+  return {
+    schemaVersion: 1,
+    ok: false,
+    error: {
+      code,
+      message,
+      diagnostics: formatFailureDiagnostic(error, { seen: new Set() }),
+    },
+  };
+}
+
+function findUpdateInvariantError(value, code) {
+  const pending = [value];
+  const seen = new Set();
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (!current || (typeof current !== "object" && typeof current !== "function")) {
+      continue;
+    }
+    if (seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+    if (current instanceof UpdateInvariantError && current.code === code) {
+      return current;
+    }
+    if (current instanceof AggregateError) {
+      pending.push(...current.errors);
+    }
+    if ("cause" in current) {
+      pending.push(current.cause);
+    }
+  }
+  return null;
+}
+
+function findUnsafeCommandCleanupFailure(value) {
+  const failure = findUpdateInvariantError(value, "command_cleanup_failed");
+  const unsafeTreeState = ["indeterminate", "live"].includes(failure?.details?.processTreeState);
+  const retainedByProcessGroup = Number.isSafeInteger(failure?.details?.processGroupId);
+  const retainedForManualRecovery = failure?.details?.manualRecoveryRequired === true;
+  return failure && unsafeTreeState && (retainedByProcessGroup || retainedForManualRecovery)
+    ? failure
+    : null;
+}
+
+function boundedSyncOptions(options = {}, timeoutMs = LEAF_COMMAND_TIMEOUT_MS) {
+  return {
+    ...options,
+    killSignal: "SIGKILL",
+    timeout: timeoutMs,
+  };
 }
 
 function git(checkout, args, options = {}) {
   return execFileSync("git", ["-C", checkout, ...args], {
+    ...boundedSyncOptions({}, options.timeoutMs),
     encoding: options.encoding ?? "utf8",
+    maxBuffer: 32 * 1024 * 1024,
     stdio: options.stdio ?? ["ignore", "pipe", "pipe"],
   });
 }
@@ -121,7 +513,7 @@ function applicableUrlRewrite(checkout, remoteUrl) {
   );
 }
 
-export function originMatches(remoteUrl) {
+function originMatches(remoteUrl) {
   return githubSlug(remoteUrl) === DEFAULT_EXPECTED_ORIGIN;
 }
 
@@ -152,7 +544,7 @@ function isAncestorCommit(checkout, ancestor, descendant = "HEAD") {
   }
 }
 
-export function classifyActions(
+function classifyActions(
   changedPaths,
   { buildProvenanceKnown, buildRequired, nodeModulesPresent },
 ) {
@@ -204,7 +596,7 @@ function canonicalBuildRequirements(checkout) {
     cwd: checkout,
     env: process.env,
     fs: fsImpl,
-    spawnSync,
+    spawnSync: (command, args, options) => spawnSync(command, args, boundedSyncOptions(options)),
     distRoot,
     distEntry: path.join(distRoot, "entry.js"),
     buildStampPath: path.join(distRoot, BUILD_STAMP_FILE),
@@ -388,19 +780,31 @@ function verifyCheckout(checkout, { remote }) {
   };
 }
 
-function updateMain({ checkout, remote }, dependencies = {}) {
+async function updateMain({ checkout, remote }, runCommand, dependencies = {}) {
   const before = verifyCheckout(checkout, { remote });
   const fetchMain =
     dependencies.fetchMain ??
     ((target, remoteName) =>
-      git(
+      runUpdateCommand(
+        runCommand,
+        "git.fetch",
+        "git",
+        [
+          "-C",
+          target,
+          "fetch",
+          "--prune",
+          remoteName,
+          `refs/heads/main:refs/remotes/${remoteName}/main`,
+        ],
         target,
-        ["fetch", "--prune", remoteName, `refs/heads/main:refs/remotes/${remoteName}/main`],
         {
-          stdio: ["ignore", "ignore", "inherit"],
+          phase: "Git fetch",
+          serviceState: "running",
+          timeoutMs: COMMAND_TIMEOUT_MS.gitFetch,
         },
       ));
-  fetchMain(before.checkout, remote);
+  await fetchMain(before.checkout, remote);
   const afterFetch = verifyCheckout(before.checkout, { remote });
   if (afterFetch.headSha !== before.headSha) {
     throw new UpdateInvariantError(
@@ -410,9 +814,18 @@ function updateMain({ checkout, remote }, dependencies = {}) {
   }
 
   const remoteSha = gitText(before.checkout, ["rev-parse", `${remote}/main`]);
-  git(before.checkout, ["merge", "--ff-only", `${remote}/main`], {
-    stdio: ["ignore", "ignore", "inherit"],
-  });
+  await runUpdateCommand(
+    runCommand,
+    "git.merge",
+    "git",
+    ["-C", before.checkout, "merge", "--ff-only", `${remote}/main`],
+    before.checkout,
+    {
+      phase: "Git fast-forward merge",
+      serviceState: "running",
+      timeoutMs: COMMAND_TIMEOUT_MS.gitMerge,
+    },
+  );
   const after = verifyCheckout(before.checkout, { remote });
   if (after.headSha !== remoteSha) {
     throw new UpdateInvariantError(
@@ -483,6 +896,22 @@ function processAlive(pid) {
   }
 }
 
+function processGroupAlive(processGroupId) {
+  if (
+    process.platform === "win32" ||
+    !Number.isSafeInteger(processGroupId) ||
+    processGroupId <= 1
+  ) {
+    return false;
+  }
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
 export function acquireMaintenanceLock(checkout, requestedPath) {
   const lockPath = requestedPath ?? defaultLockPath(checkout);
   let incompleteLockRetries = 0;
@@ -517,13 +946,17 @@ export function acquireMaintenanceLock(checkout, requestedPath) {
         // budget and only then declare the lock invalid.
         if (incompleteLockRetries < 20) {
           incompleteLockRetries += 1;
-          spawnSync("sleep", ["0.01"]);
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
           continue;
         }
         throw new UpdateInvariantError("invalid_lock", `lock owner is unreadable: ${lockPath}`);
       }
       incompleteLockRetries = 0;
-      if (Number.isInteger(owner.pid) && processAlive(owner.pid)) {
+      const ownerProcessAlive = Number.isInteger(owner.pid) && processAlive(owner.pid);
+      const blockedProcessGroupAlive =
+        Number.isInteger(owner.processGroupId) && processGroupAlive(owner.processGroupId);
+      const manualRecoveryRequired = owner.manualRecoveryRequired === true;
+      if (ownerProcessAlive || blockedProcessGroupAlive || manualRecoveryRequired) {
         return { acquired: false, lockPath, owner };
       }
       const staleClaim = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
@@ -549,6 +982,38 @@ export function acquireMaintenanceLock(checkout, requestedPath) {
     acquired: true,
     lockPath,
     owner,
+    retainForCleanupFailure(details = {}) {
+      const processGroupId = details.processGroupId;
+      const manualRecoveryRequired = details.manualRecoveryRequired === true;
+      if (
+        (!Number.isSafeInteger(processGroupId) || processGroupId <= 1) &&
+        !manualRecoveryRequired
+      ) {
+        throw new UpdateInvariantError(
+          "invalid_cleanup_lock",
+          "refusing to retain maintenance lock without a process group or manual recovery state",
+        );
+      }
+      const ownerPath = path.join(lockPath, "owner.json");
+      const current = JSON.parse(readFileSync(ownerPath, "utf8"));
+      if (current.pid !== process.pid) {
+        throw new UpdateInvariantError("lock_owner_changed", "maintenance lock ownership changed");
+      }
+      const retainedOwner = {
+        ...current,
+        blockedAt: new Date().toISOString(),
+        reason: "command_cleanup_failed",
+        ...(Number.isSafeInteger(processGroupId) ? { processGroupId } : {}),
+        ...(manualRecoveryRequired ? { manualRecoveryRequired: true } : {}),
+        ...(typeof details.phase === "string" ? { phase: details.phase } : {}),
+        ...(typeof details.processTreeState === "string"
+          ? { processTreeState: details.processTreeState }
+          : {}),
+        ...(typeof details.serviceState === "string" ? { serviceState: details.serviceState } : {}),
+      };
+      writeFileSync(ownerPath, `${JSON.stringify(retainedOwner)}\n`, { mode: 0o600 });
+      return retainedOwner;
+    },
     release() {
       const current = JSON.parse(readFileSync(path.join(lockPath, "owner.json"), "utf8"));
       if (current.pid !== process.pid) {
@@ -559,11 +1024,63 @@ export function acquireMaintenanceLock(checkout, requestedPath) {
   };
 }
 
-function defaultRunCommand(command, args, checkout) {
-  execFileSync(command, args, {
-    cwd: checkout,
-    stdio: ["ignore", process.stderr, process.stderr],
-  });
+async function defaultRunCommand(command, args, checkout, options = {}) {
+  const phase = options.phase ?? "command";
+  const timeoutMs = options.timeoutMs ?? LEAF_COMMAND_TIMEOUT_MS;
+  const startedAt = Date.now();
+  try {
+    const managedRunner = options.runManagedCommand ?? runManagedCommand;
+    const status = await managedRunner({
+      bin: command,
+      args,
+      cwd: checkout,
+      requireProcessTreeExit: true,
+      stdio: ["ignore", 2, 2],
+      timeoutMs,
+    });
+    if (status !== 0) {
+      throw new Error(`${phase} command exited with status ${status}`);
+    }
+  } catch (error) {
+    if (error?.code === "EPROCESS_TREE_VERIFICATION_UNSUPPORTED") {
+      throw new UpdateInvariantError(
+        "unsupported_process_tree_verification",
+        `${phase} requires process-tree verification unavailable on this platform`,
+        {
+          phase,
+          serviceState: options.serviceState ?? "running",
+        },
+      );
+    }
+    if (error?.code === "EPROCESSGROUP_CLEANUP_FAILED") {
+      throw new UpdateInvariantError(
+        "command_cleanup_failed",
+        `${phase} process tree could not be cleaned up`,
+        {
+          elapsedMs: Date.now() - startedAt,
+          phase,
+          ...(Number.isSafeInteger(error.processGroupId)
+            ? { processGroupId: error.processGroupId }
+            : {}),
+          ...(typeof error.processTreeState === "string"
+            ? { processTreeState: error.processTreeState }
+            : {}),
+          ...(error.manualRecoveryRequired === true ? { manualRecoveryRequired: true } : {}),
+          serviceState: options.serviceState ?? "running",
+          timeoutMs,
+        },
+      );
+    }
+    if (error?.code !== "ETIMEDOUT") {
+      throw error;
+    }
+    throw new UpdateInvariantError("command_timeout", `${phase} timed out after ${timeoutMs}ms`, {
+      elapsedMs: Date.now() - startedAt,
+      phase,
+      serviceState: options.serviceState ?? "running",
+      timeoutMs,
+    });
+  }
 }
 
 function readSnapshotMetadata(snapshotRoot) {
@@ -712,8 +1229,14 @@ function resolveManagedGatewayCommand(
     prefix = [envFilePath];
   }
   const runtime = programArguments[commandStartIndex];
-  const entrypoint = programArguments[commandStartIndex + 1];
-  const command = programArguments[commandStartIndex + 2];
+  const runtimeArguments = programArguments.slice(commandStartIndex);
+  const { position } = resolveRuntimeScriptPosition(runtimeArguments);
+  if (typeof position !== "number") {
+    return null;
+  }
+  const entrypointIndex = commandStartIndex + position;
+  const entrypoint = programArguments[entrypointIndex];
+  const command = programArguments[entrypointIndex + 1];
   // Arbitrary --wrapper executables contain no checkout entrypoint, so their
   // ownership cannot be proven and conversion must remain a manual operation.
   return typeof runtime === "string" &&
@@ -722,10 +1245,12 @@ function resolveManagedGatewayCommand(
     command === "gateway"
     ? {
         entrypoint,
-        entrypointIndex: commandStartIndex + 1,
+        entrypointIndex,
         envFilePath,
         executable,
-        invocationPrefix: wrapperPath ? [...prefix, runtime, entrypoint] : [entrypoint],
+        invocationPrefix: wrapperPath
+          ? [...prefix, ...runtimeArguments.slice(0, position + 1)]
+          : runtimeArguments.slice(1, position + 1),
         runtime,
         stateDir: path.dirname(envDir),
         wrapperPath,
@@ -756,7 +1281,7 @@ function isTrustedGeneratedEnvironmentWrapper(command) {
       (envFileStat.mode & 0o077) === 0 &&
       realpathSync(command.wrapperPath) === command.wrapperPath &&
       realpathSync(command.envFilePath) === command.envFilePath &&
-      readFileSync(command.wrapperPath, "utf8") === GENERATED_LAUNCH_AGENT_ENV_WRAPPER
+      isGeneratedLaunchAgentEnvironmentWrapper(readFileSync(command.wrapperPath, "utf8"))
     );
   } catch {
     return false;
@@ -773,10 +1298,11 @@ function isTrustedOwnedRegularFile(fileStat) {
 }
 
 export function resolveLaunchAgentExitTimeoutSeconds(value) {
-  if (value === 0 || (Number.isInteger(value) && value > MAX_LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS)) {
+  if (value === 0 || (Number.isInteger(value) && value > LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS)) {
     throw new UpdateInvariantError(
       "gateway_launchagent_failed",
       `managed Gateway LaunchAgent ExitTimeOut=${value} prevents bounded stopped proof`,
+      { exitTimeoutSeconds: value },
     );
   }
   return Number.isInteger(value) && value > 0 ? value : DEFAULT_LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS;
@@ -784,7 +1310,37 @@ export function resolveLaunchAgentExitTimeoutSeconds(value) {
 
 function isLaunchctlServiceMissing(result) {
   const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-  return result.status !== 0 && /could not find service|no such process|not found/iu.test(output);
+  // Partial output from a killed or failed query cannot establish absence.
+  return (
+    Number.isInteger(result.status) &&
+    result.status !== 0 &&
+    !result.error &&
+    !result.signal &&
+    /could not find service|no such process|not found/iu.test(output)
+  );
+}
+
+function readLaunchDaemonPlistBytes(plistPath) {
+  const limit = 1024 * 1024;
+  const fd = openSync(plistPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > limit) {
+      throw new Error("LaunchDaemon plist must be a regular file of at most 1 MiB");
+    }
+    const bytes = Buffer.alloc(limit + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, null);
+      if (count === 0) {
+        return bytes.subarray(0, length);
+      }
+      length += count;
+    }
+    throw new Error("LaunchDaemon plist exceeds 1 MiB");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function assertNoSystemLaunchDaemonOwnership(label, dependencies = {}) {
@@ -792,7 +1348,11 @@ export function assertNoSystemLaunchDaemonOwnership(label, dependencies = {}) {
   const readDirectory = dependencies.readdirSync ?? readdirSync;
   const serviceTarget = `system/${label}`;
   const inspectLoadedService = () => {
-    const result = run("/bin/launchctl", ["print", serviceTarget], { encoding: "utf8" });
+    const result = run(
+      "/bin/launchctl",
+      ["print", serviceTarget],
+      boundedSyncOptions({ encoding: "utf8" }),
+    );
     if (result.status === 0) {
       throw new UpdateInvariantError(
         "gateway_system_launchdaemon_conflict",
@@ -823,18 +1383,42 @@ export function assertNoSystemLaunchDaemonOwnership(label, dependencies = {}) {
   }
   for (const entry of entries.filter((candidate) => candidate.endsWith(".plist")).toSorted()) {
     const plistPath = path.join(SYSTEM_LAUNCH_DAEMON_DIR, entry);
+    let bytes;
+    try {
+      bytes = readLaunchDaemonPlistBytes(plistPath);
+    } catch (error) {
+      // Same unreadable-file policy as the CLI: actual read errno, never a
+      // parser diagnostic or filename, admits this visibility exception.
+      if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) {
+        continue;
+      }
+      throw new UpdateInvariantError(
+        "gateway_system_launchdaemon_unverifiable",
+        `could not read system LaunchDaemon plist ${plistPath}`,
+      );
+    }
+    // Extract only the exact string Label: valid vendor metadata can contain
+    // date/data scalars that whole-plist JSON cannot represent.
+    const options = boundedSyncOptions({ encoding: "utf8", input: bytes, maxBuffer: 1024 * 1024 });
     const result = run(
       "/usr/bin/plutil",
-      ["-extract", "Label", "raw", "-o", "-", "--", plistPath],
-      { encoding: "utf8" },
+      ["-extract", "Label", "raw", "-expect", "string", "-n", "-o", "-", "--", "-"],
+      options,
     );
-    if (result.status !== 0) {
+    if (result.status !== 0 || result.error || result.signal) {
+      const lint =
+        Number.isInteger(result.status) && !result.error && !result.signal
+          ? run("/usr/bin/plutil", ["-lint", "--", "-"], options)
+          : undefined;
+      if (lint?.status === 0 && !lint.error && !lint.signal) {
+        continue;
+      }
       throw new UpdateInvariantError(
         "gateway_system_launchdaemon_unverifiable",
         `could not inspect system LaunchDaemon plist ${plistPath}`,
       );
     }
-    if (String(result.stdout).trim() === label) {
+    if (result.stdout === label) {
       throw new UpdateInvariantError(
         "gateway_system_launchdaemon_conflict",
         `System LaunchDaemon plist ${plistPath} already owns the managed Gateway label`,
@@ -872,9 +1456,11 @@ function readManagedGatewayLaunchAgent(checkout) {
       "managed Gateway LaunchAgent is not a regular owned plist file",
     );
   }
-  const plistResult = spawnSync("/usr/bin/plutil", ["-convert", "json", "-o", "-", plistPath], {
-    encoding: "utf8",
-  });
+  const plistResult = spawnSync(
+    "/usr/bin/plutil",
+    ["-convert", "json", "-o", "-", plistPath],
+    boundedSyncOptions({ encoding: "utf8" }),
+  );
   if (plistResult.status !== 0) {
     throw new UpdateInvariantError(
       "gateway_launchagent_failed",
@@ -940,7 +1526,10 @@ function readManagedGatewayLaunchAgent(checkout) {
 
 function inspectManagedGatewayDeployment(checkout) {
   if (process.platform !== "darwin") {
-    return null;
+    throw new UpdateInvariantError(
+      "unsupported_gateway_control_platform",
+      "live updater managed Gateway control requires macOS LaunchAgent inspection; Linux systemd installs must use the standard update CLI instead of this helper",
+    );
   }
   const home = process.env.HOME;
   if (!home || !existsSync(path.join(home, "Library/LaunchAgents/ai.openclaw.gateway.plist"))) {
@@ -949,6 +1538,13 @@ function inspectManagedGatewayDeployment(checkout) {
   return readManagedGatewayLaunchAgent(checkout);
 }
 
+/**
+ * @param {string} checkout
+ * @param {GatewayRepointDeployment} deployment
+ * @param {(deployment: GatewayRepointDeployment, replacement: string) => void} replaceEntrypoint
+ * @param {(checkout: string) => GatewayRepointDeployment | null} [inspectDeployment]
+ * @returns {GatewayRepointDeployment & { changed: boolean, previousEntrypoint?: string }}
+ */
 export function repointManagedGatewayDeployment(
   checkout,
   deployment,
@@ -1005,7 +1601,7 @@ function prepareLaunchAgentEntrypointReplacement(deployment, entrypoint, options
     const plistResult = spawnSync(
       "/usr/bin/plutil",
       ["-convert", "json", "-o", "-", temporaryPath],
-      { encoding: "utf8" },
+      boundedSyncOptions({ encoding: "utf8" }),
     );
     if (plistResult.status !== 0) {
       throw new UpdateInvariantError(
@@ -1022,15 +1618,15 @@ function prepareLaunchAgentEntrypointReplacement(deployment, entrypoint, options
     execFileSync(
       "/usr/bin/plutil",
       ["-replace", "ProgramArguments", "-json", JSON.stringify(programArguments), temporaryPath],
-      { stdio: ["ignore", "ignore", "pipe"] },
+      boundedSyncOptions({ stdio: ["ignore", "ignore", "pipe"] }),
     );
     execFileSync("/usr/bin/plutil", ["-lint", temporaryPath], {
-      stdio: ["ignore", "ignore", "pipe"],
+      ...boundedSyncOptions({ stdio: ["ignore", "ignore", "pipe"] }),
     });
     const validatedResult = spawnSync(
       "/usr/bin/plutil",
       ["-convert", "json", "-o", "-", temporaryPath],
-      { encoding: "utf8" },
+      boundedSyncOptions({ encoding: "utf8" }),
     );
     if (
       validatedResult.status !== 0 ||
@@ -1092,7 +1688,10 @@ function prepareLaunchAgentEntrypointReplacement(deployment, entrypoint, options
             restore();
           } catch (restoreError) {
             throw aggregateErrorWithCause(
-              [ownershipError, restoreError],
+              [
+                { role: "primary", error: ownershipError },
+                { role: "rollback", error: restoreError },
+              ],
               "System LaunchDaemon ownership changed during plist publication and the previous LaunchAgent could not be restored",
               restoreError,
             );
@@ -1141,7 +1740,7 @@ function verifyManagedGatewayRuntime(checkout, expectedSha) {
   const launchctl = spawnSync(
     "/bin/launchctl",
     ["print", `gui/${process.getuid()}/${deployment.label}`],
-    { encoding: "utf8" },
+    boundedSyncOptions({ encoding: "utf8" }),
   );
   const pidMatch = launchctl.status === 0 ? launchctl.stdout.match(/\bpid = (\d+)\b/u) : null;
   const pid = Number(pidMatch?.[1] ?? Number.NaN);
@@ -1176,7 +1775,7 @@ function verifyManagedGatewayRuntime(checkout, expectedSha) {
   const listeners = spawnSync(
     "/usr/sbin/lsof",
     ["-nP", `-iTCP:${deployment.port}`, "-sTCP:LISTEN", "-t"],
-    { encoding: "utf8" },
+    boundedSyncOptions({ encoding: "utf8" }),
   );
   const listenerPids = listeners.stdout.trim().split(/\s+/u).filter(Boolean).map(Number);
   // The Gateway overwrites process.title, so ps cannot prove argv. The owned
@@ -1190,7 +1789,7 @@ function verifyManagedGatewayRuntime(checkout, expectedSha) {
   return { commit: expectedSha, entrypoint: sourceEntrypoint, pid, port: deployment.port };
 }
 
-export function parseLaunchctlArguments(output) {
+function parseLaunchctlArguments(output) {
   const block = output.match(/\n\s*arguments = \{\n(?<body>[\s\S]*?)\n\s*\}/u)?.groups?.body;
   return block
     ? block
@@ -1200,6 +1799,13 @@ export function parseLaunchctlArguments(output) {
     : [];
 }
 
+/**
+ * @param {string} checkout
+ * @param {string[]} args
+ * @param {GatewayCliDeployment | null | undefined} deployment
+ * @param {{ stderr?: "inherit" | "pipe", timeoutMs?: number }} [options]
+ * @returns {string}
+ */
 export function runBuiltGatewayCli(checkout, args, deployment, options = {}) {
   const observedDeployment = deployment ?? readManagedGatewayLaunchAgent(checkout);
   const sourceEntrypoint = path.join(checkout, "dist/index.js");
@@ -1226,7 +1832,6 @@ export function runBuiltGatewayCli(checkout, args, deployment, options = {}) {
     executable,
     invocationPrefix,
     port,
-    runtime,
     serviceEnvironment = {},
     workingDirectory,
     wrapperPath,
@@ -1248,7 +1853,11 @@ export function runBuiltGatewayCli(checkout, args, deployment, options = {}) {
       const configuredPath = execFileSync(
         executable,
         [...wrapperPrefix, "/usr/bin/printenv", "OPENCLAW_CONFIG_PATH"],
-        { encoding: "utf8", env: baseEnv, stdio: ["ignore", "pipe", "ignore"] },
+        boundedSyncOptions({
+          encoding: "utf8",
+          env: baseEnv,
+          stdio: ["ignore", "pipe", "ignore"],
+        }),
       ).trim();
       if (configuredPath) {
         effectiveConfigPath = configuredPath;
@@ -1283,8 +1892,7 @@ export function runBuiltGatewayCli(checkout, args, deployment, options = {}) {
             "-u",
             "OPENCLAW_GATEWAY_URL",
             ...envOverrides,
-            runtime,
-            entrypoint,
+            ...invocationPrefix.slice(executable === "/bin/sh" ? 2 : 1),
             ...args,
           ]
         : [...invocationPrefix, ...args];
@@ -1296,11 +1904,20 @@ export function runBuiltGatewayCli(checkout, args, deployment, options = {}) {
       stdio: ["ignore", "pipe", options.stderr ?? "inherit"],
       timeout: options.timeoutMs ?? GATEWAY_CLI_TIMEOUT_MS,
     });
+  } catch (error) {
+    throw new UpdateCommandError(gatewayCliOperation(args), error);
   } finally {
     rmSync(overlayPath, { force: true });
   }
 }
 
+/**
+ * @param {string} checkout
+ * @param {string} method
+ * @param {Record<string, unknown>} params
+ * @param {GatewayCliDeployment | null | undefined} deployment
+ * @returns {string}
+ */
 export function runBuiltGatewayCall(checkout, method, params, deployment) {
   const managedDeployment = deployment ?? readManagedGatewayLaunchAgent(checkout);
   return runBuiltGatewayCli(
@@ -1319,28 +1936,46 @@ export function runBuiltGatewayCall(checkout, method, params, deployment) {
   );
 }
 
+/**
+ * @param {string} checkout
+ * @param {(checkout: string, method: string, params: { requestId: string, terminalPolicy?: "terminate" }, deployment: GatewayCliDeployment | null) => string} [callGateway]
+ * @param {GatewayCliDeployment | null} [deployment]
+ */
 export function prepareGatewaySuspension(
   checkout,
   callGateway = runBuiltGatewayCall,
   deployment = null,
 ) {
   const requestId = `openclaw-live-updater-${randomUUID()}`;
+  const callPrepare = (params) =>
+    JSON.parse(callGateway(checkout, "gateway.suspend.prepare", params, deployment));
   let result;
+  let controlledDrainSupported = true;
   try {
-    result = JSON.parse(
-      callGateway(checkout, "gateway.suspend.prepare", { requestId }, deployment),
-    );
+    try {
+      result = callPrepare({ requestId, terminalPolicy: "terminate" });
+    } catch (error) {
+      if (!isLegacyGatewaySuspendPrepareParamsError(error)) {
+        throw error;
+      }
+      // Older closed schemas reject the new field before acquiring a lease.
+      // Retry once with preserve semantics so mixed-version updates remain safe.
+      controlledDrainSupported = false;
+      result = callPrepare({ requestId });
+    }
   } catch (error) {
     throw new UpdateInvariantError(
       "gateway_suspend_prepare_failed",
-      `could not atomically prepare Gateway maintenance: ${error instanceof Error ? error.message : String(error)}`,
+      "could not atomically prepare Gateway maintenance",
+      undefined,
+      { cause: error },
     );
   }
   if (result?.status === "ready" && typeof result.suspensionId === "string") {
     return result;
   }
   if (result?.status === "busy" && Array.isArray(result.blockers)) {
-    return result;
+    return controlledDrainSupported ? result : { ...result, controlledDrainSupported: false };
   }
   throw new UpdateInvariantError(
     "gateway_suspend_prepare_invalid",
@@ -1348,19 +1983,132 @@ export function prepareGatewaySuspension(
   );
 }
 
+async function drainManagedGatewayForMaintenance(
+  checkout,
+  deployment,
+  controlDeployment,
+  stop,
+  assertAuthority,
+) {
+  if (!deployment) {
+    throw new UpdateInvariantError(
+      "gateway_suspend_prepare_failed",
+      "Managed Gateway inspection is required for controlled interruption",
+    );
+  }
+  const [{ withGatewayMaintenanceDrain }, { readGatewayServiceState }, { resolveGatewayService }] =
+    await Promise.all([
+      import("../../../../src/cli/update-cli/update-command-service-drain.js"),
+      import("../../../../src/daemon/service-state.js"),
+      import("../../../../src/daemon/service.js"),
+    ]);
+  const env = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: deployment.stateDir,
+    OPENCLAW_CONFIG_PATH: deployment.configPath,
+    OPENCLAW_GATEWAY_PORT: String(deployment.port),
+  };
+  delete env.OPENCLAW_GATEWAY_URL;
+  delete env.OPENCLAW_GATEWAY_TOKEN;
+  delete env.OPENCLAW_GATEWAY_PASSWORD;
+  const state = await readGatewayServiceState(resolveGatewayService(), {
+    env,
+    requireEffective: true,
+    timeoutMs: GATEWAY_CLI_TIMEOUT_MS,
+  });
+  const commandEntrypoint = resolveManagedGatewayEntrypoint(
+    state.command?.programArguments,
+    process.env.HOME,
+    deployment.stateDir,
+  );
+  if (
+    !state.running ||
+    !Number.isInteger(state.runtime?.pid) ||
+    commandEntrypoint !== deployment.entrypoint ||
+    state.command?.sourcePath !== deployment.plistPath
+  ) {
+    throw new UpdateInvariantError(
+      "gateway_runtime_mismatch",
+      "Managed Gateway changed before controlled maintenance",
+    );
+  }
+  const binding = JSON.stringify(deployment);
+  const envBytes = deployment.envFilePath ? readFileSync(deployment.envFilePath) : null;
+  let stopCommitted = false;
+  const assertCurrent = () => {
+    assertAuthority();
+    if (
+      JSON.stringify(readManagedGatewayLaunchAgent(checkout)) !== binding ||
+      (envBytes && !readFileSync(deployment.envFilePath).equals(envBytes))
+    ) {
+      throw new UpdateInvariantError(
+        "gateway_runtime_mismatch",
+        "Managed Gateway binding changed during maintenance drain",
+      );
+    }
+    if (!stopCommitted) {
+      const loaded = spawnSync(
+        "/bin/launchctl",
+        ["print", `gui/${process.getuid()}/${deployment.label}`],
+        boundedSyncOptions({ encoding: "utf8" }),
+      );
+      const pid = Number(
+        loaded.status === 0 ? loaded.stdout.match(/\bpid = (\d+)\b/u)?.[1] : Number.NaN,
+      );
+      if (pid !== state.runtime.pid) {
+        throw new UpdateInvariantError(
+          "gateway_runtime_mismatch",
+          "Managed Gateway process changed during maintenance drain",
+        );
+      }
+    }
+  };
+  assertCurrent();
+  return withGatewayMaintenanceDrain(
+    {
+      state,
+      drainPolicy: "interrupt-after-drain",
+      assertCurrent,
+      warn: (message) => process.stderr.write(`${message}\n`),
+      control: {
+        stopTimeoutMs: deployment.exitTimeoutSeconds * 1_000,
+        async call(method, params, beforeDispatch) {
+          assertCurrent();
+          beforeDispatch?.();
+          const result = JSON.parse(
+            runBuiltGatewayCall(checkout, method, params, controlDeployment),
+          );
+          if (method === "gateway.suspend.handoff" && result.status === "committed") {
+            // The serving owner has committed one-way shutdown; it may exit before bootout.
+            stopCommitted = true;
+          }
+          assertCurrent();
+          return result;
+        },
+      },
+    },
+    ({ prepareEffect }) => stop(() => prepareEffect(assertCurrent)),
+  );
+}
+
 function defaultResumeGatewaySuspension(checkout, suspensionId, deployment) {
   runBuiltGatewayCall(checkout, "gateway.suspend.resume", { suspensionId }, deployment);
 }
 
-function stopManagedGateway(runCommand, checkout, deployment) {
-  if (!deployment) {
-    runCommand(process.execPath, ["dist/index.js", "gateway", "stop"], checkout);
-    return;
-  }
-  runCommand(
-    "/bin/launchctl",
-    ["bootout", `gui/${process.getuid()}/${deployment.label}`],
+async function stopManagedGateway(runCommand, checkout, deployment) {
+  await runUpdateCommand(
+    runCommand,
+    deployment ? "launchd.bootout" : "gateway.stop",
+    deployment ? "/bin/launchctl" : process.execPath,
+    deployment
+      ? ["bootout", `gui/${process.getuid()}/${deployment.label}`]
+      : ["dist/index.js", "gateway", "stop"],
     checkout,
+    {
+      phase: deployment ? "Gateway LaunchAgent bootout" : "gateway stop",
+      serviceState: "stopping",
+      timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+    },
   );
 }
 
@@ -1379,7 +2127,7 @@ function recordStoppedMilestones(timing, observation, now) {
   }
 }
 
-function stopManagedGatewayAndProve(
+async function stopManagedGatewayAndProve(
   runCommand,
   checkout,
   deployment,
@@ -1396,7 +2144,7 @@ function stopManagedGatewayAndProve(
   };
   let stopError;
   try {
-    stopManagedGateway(runCommand, checkout, deployment);
+    await stopManagedGateway(runCommand, checkout, deployment);
   } catch (error) {
     stopError = error;
   } finally {
@@ -1413,7 +2161,7 @@ function stopManagedGatewayAndProve(
   let proofError;
   for (let attempt = 0; attempt < proofAttempts; attempt += 1) {
     try {
-      const proof = proveGatewayStopped(checkout);
+      const proof = await proveGatewayStopped(checkout);
       recordStoppedMilestones(timing, proof, now);
       recordGatewayTimestamp(timing, "processExitedAt", timestampAt(now));
       recordGatewayTimestamp(timing, "listenerClosedAt", timestampAt(now));
@@ -1422,7 +2170,7 @@ function stopManagedGatewayAndProve(
       proofError = error;
       recordStoppedMilestones(timing, error, now);
       if (attempt + 1 < proofAttempts) {
-        sleep(GATEWAY_STOP_PROOF_RETRY_DELAY_MS);
+        await sleep(GATEWAY_STOP_PROOF_RETRY_DELAY_MS);
       }
     }
   }
@@ -1430,7 +2178,10 @@ function stopManagedGatewayAndProve(
     throw proofError;
   }
   throw aggregateErrorWithCause(
-    [stopError, proofError],
+    [
+      { role: "primary", error: stopError },
+      { role: "proof", error: proofError },
+    ],
     "Gateway stop command failed and native stopped proof did not converge",
     proofError,
   );
@@ -1451,12 +2202,7 @@ function isTrustedSourceControlBuild(checkout, buildState, currentHead) {
   ) {
     return false;
   }
-  try {
-    git(checkout, ["merge-base", "--is-ancestor", commit, currentHead]);
-    return true;
-  } catch {
-    return false;
-  }
+  return isAncestorCommit(checkout, commit, currentHead);
 }
 
 function resolveGatewayControlDeployment(checkout, deployment, buildBefore, currentHead) {
@@ -1481,17 +2227,21 @@ function resolveGatewayControlDeployment(checkout, deployment, buildBefore, curr
 
 function proveMacLaunchdGatewayStopped(checkout) {
   const { label, port } = readManagedGatewayLaunchAgent(checkout);
-  const launchctl = spawnSync("/bin/launchctl", ["print", `gui/${process.getuid()}/${label}`], {
-    encoding: "utf8",
-  });
+  const launchctl = spawnSync(
+    "/bin/launchctl",
+    ["print", `gui/${process.getuid()}/${label}`],
+    boundedSyncOptions({ encoding: "utf8" }),
+  );
   const launchctlOutput = `${launchctl.stdout ?? ""}\n${launchctl.stderr ?? ""}`;
   const serviceBootedOut =
     launchctl.status !== 0 && /could not find service|service not found/iu.test(launchctlOutput);
   const processExited =
     serviceBootedOut || (launchctl.status === 0 && !/\bpid\s*=\s*\d+\b/iu.test(launchctlOutput));
-  const listeners = spawnSync("/usr/sbin/lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], {
-    encoding: "utf8",
-  });
+  const listeners = spawnSync(
+    "/usr/sbin/lsof",
+    ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"],
+    boundedSyncOptions({ encoding: "utf8" }),
+  );
   const listenerClosed =
     listeners.status === 1 && !listeners.stdout.trim() && !listeners.stderr.trim();
   const details = { listenerClosed, processExited, serviceBootedOut };
@@ -1528,13 +2278,19 @@ function defaultProveGatewayStopped(checkout) {
       execFileSync(process.execPath, ["dist/index.js", "gateway", "status", "--json"], {
         cwd: checkout,
         encoding: "utf8",
+        killSignal: "SIGKILL",
         stdio: ["ignore", "pipe", "inherit"],
+        timeout: COMMAND_TIMEOUT_MS.gatewayProbe,
       }),
     );
   } catch (error) {
+    const commandError =
+      error instanceof UpdateCommandError ? error : new UpdateCommandError("gateway.status", error);
     throw new UpdateInvariantError(
       "gateway_stopped_proof_failed",
-      `could not inspect the managed Gateway after suspension failed: ${error instanceof Error ? error.message : String(error)}`,
+      "could not inspect the managed Gateway after suspension failed",
+      undefined,
+      { cause: commandError },
     );
   }
   const runtime = result?.service?.runtime;
@@ -1590,10 +2346,19 @@ function isOriginalMacBundle(bundlePath, originalStat) {
   }
 }
 
-function runBuildWithPreservedMacApp(runCommand, checkout, sleep = defaultSleep) {
+async function runBuildWithPreservedMacApp(
+  runCommand,
+  checkout,
+  sleep = defaultSleep,
+  serviceState = "stopped",
+) {
   const appBundle = path.join(checkout, "dist/OpenClaw.app");
   if (!existsSync(appBundle)) {
-    runCommand("pnpm", ["build"], checkout);
+    await runUpdateCommand(runCommand, "build", "pnpm", ["build"], checkout, {
+      phase: "Gateway build",
+      serviceState,
+      timeoutMs: COMMAND_TIMEOUT_MS.gatewayBuild,
+    });
     return;
   }
   const appStat = lstatSync(appBundle);
@@ -1612,7 +2377,11 @@ function runBuildWithPreservedMacApp(runCommand, checkout, sleep = defaultSleep)
   let buildFailed = false;
   let buildError;
   try {
-    runCommand("pnpm", ["build"], checkout);
+    await runUpdateCommand(runCommand, "build", "pnpm", ["build"], checkout, {
+      phase: "Gateway build",
+      serviceState,
+      timeoutMs: COMMAND_TIMEOUT_MS.gatewayBuild,
+    });
   } catch (error) {
     buildFailed = true;
     buildError = error;
@@ -1623,7 +2392,7 @@ function runBuildWithPreservedMacApp(runCommand, checkout, sleep = defaultSleep)
     if (existsSync(preservedBundle) || existsSync(appBundle)) {
       break;
     }
-    sleep(100);
+    await sleep(100);
   }
   const alreadyRestored = isOriginalMacBundle(appBundle, appStat);
   if (!alreadyRestored && existsSync(appBundle)) {
@@ -1674,7 +2443,7 @@ function runBuildWithPreservedMacApp(runCommand, checkout, sleep = defaultSleep)
   }
 }
 
-function restartGateway(
+async function restartGateway(
   runCommand,
   checkout,
   expectedSha,
@@ -1685,30 +2454,48 @@ function restartGateway(
 ) {
   assertExactBuild(checkout, expectedSha);
   if (!deployment) {
-    runCommand("pnpm", ["openclaw", "gateway", "restart"], checkout);
+    await runUpdateCommand(
+      runCommand,
+      "gateway.restart",
+      "pnpm",
+      ["openclaw", "gateway", "restart"],
+      checkout,
+      {
+        phase: "Gateway restart",
+        serviceState: "stopped",
+        timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+      },
+    );
     return { processStartedAt: null, restartStartedAtMs: startedAtMs };
   }
   if (bootstrap) {
     return {
-      ...bootstrapManagedGateway(runCommand, checkout, deployment, {
+      ...(await bootstrapManagedGateway(runCommand, checkout, deployment, {
         ...options,
         startupTrace: true,
-      }),
+      })),
       restartStartedAtMs: startedAtMs,
     };
   }
   const assertOwnership =
     options.assertNoSystemLaunchDaemonOwnership ?? assertNoSystemLaunchDaemonOwnership;
-  assertOwnership(deployment.label);
-  runCommand(
+  await assertOwnership(deployment.label);
+  await runUpdateCommand(
+    runCommand,
+    "gateway.restart",
     deployment.executable,
     [...deployment.invocationPrefix, "gateway", "restart"],
     path.dirname(path.dirname(deployment.entrypoint)),
+    {
+      phase: "managed Gateway restart",
+      serviceState: "stopped",
+      timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+    },
   );
   return { processStartedAt: null, restartStartedAtMs: startedAtMs };
 }
 
-function bootstrapManagedGateway(runCommand, checkout, deployment, options = {}) {
+async function bootstrapManagedGateway(runCommand, checkout, deployment, options = {}) {
   const plistStat = lstatSync(deployment.plistPath);
   if (!isTrustedOwnedRegularFile(plistStat)) {
     throw new UpdateInvariantError(
@@ -1718,47 +2505,85 @@ function bootstrapManagedGateway(runCommand, checkout, deployment, options = {})
   }
   const assertOwnership =
     options.assertNoSystemLaunchDaemonOwnership ?? assertNoSystemLaunchDaemonOwnership;
-  assertOwnership(deployment.label);
+  await assertOwnership(deployment.label);
   const domain = `gui/${process.getuid()}`;
   const serviceTarget = `${domain}/${deployment.label}`;
   const waitForProcess = options.waitForProcess ?? waitForManagedGatewayProcess;
   const now = options.now ?? Date.now;
+  const start = async () => {
+    await runUpdateCommand(
+      runCommand,
+      "launchd.enable",
+      "/bin/launchctl",
+      ["enable", serviceTarget],
+      checkout,
+      {
+        phase: "Gateway LaunchAgent enable",
+        serviceState: "stopped",
+        timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+      },
+    );
+    await bootstrapLaunchAgentAndWait(
+      runCommand,
+      checkout,
+      deployment,
+      domain,
+      waitForProcess,
+      options.sleep ?? defaultSleep,
+    );
+    return timestampAt(now);
+  };
   if (!options.startupTrace) {
-    runCommand("/bin/launchctl", ["enable", serviceTarget], checkout);
-    runCommand("/bin/launchctl", ["bootstrap", domain, deployment.plistPath], checkout);
-    waitForProcess(deployment, options.sleep ?? defaultSleep);
-    return { processStartedAt: timestampAt(now) };
+    return { processStartedAt: await start() };
   }
 
   const readLaunchdEnvironment = options.readLaunchdEnvironment ?? readLaunchdEnvironmentVariable;
   const armEnvironmentRestore = options.armEnvironmentRestore ?? armLaunchdEnvironmentRestore;
-  const previousTraceValue = readLaunchdEnvironment(GATEWAY_STARTUP_TRACE_ENV);
+  const previousTraceValue = await readLaunchdEnvironment(GATEWAY_STARTUP_TRACE_ENV);
   const environmentRestore = armEnvironmentRestore(GATEWAY_STARTUP_TRACE_ENV, previousTraceValue);
   let restartError;
   let processStartedAt = null;
-  runCommand("/bin/launchctl", ["setenv", GATEWAY_STARTUP_TRACE_ENV, "1"], checkout);
+  await runUpdateCommand(
+    runCommand,
+    "launchd.setenv",
+    "/bin/launchctl",
+    ["setenv", GATEWAY_STARTUP_TRACE_ENV, "1"],
+    checkout,
+    {
+      phase: "Gateway startup trace enable",
+      serviceState: "stopped",
+      timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+    },
+  );
   try {
-    runCommand("/bin/launchctl", ["enable", serviceTarget], checkout);
-    runCommand("/bin/launchctl", ["bootstrap", domain, deployment.plistPath], checkout);
-    waitForProcess(deployment, options.sleep ?? defaultSleep);
-    processStartedAt = timestampAt(now);
+    processStartedAt = await start();
   } catch (error) {
     restartError = error;
   }
   try {
     // The booted process already inherited the trace flag. Restore launchd's
     // previous value immediately so later starts keep the host's normal config.
-    runCommand(
+    await runUpdateCommand(
+      runCommand,
+      previousTraceValue === null ? "launchd.unsetenv" : "launchd.setenv",
       "/bin/launchctl",
       previousTraceValue === null
         ? ["unsetenv", GATEWAY_STARTUP_TRACE_ENV]
         : ["setenv", GATEWAY_STARTUP_TRACE_ENV, previousTraceValue],
       checkout,
+      {
+        phase: "Gateway startup trace restore",
+        serviceState: "running",
+        timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+      },
     );
   } catch (cleanupError) {
     if (restartError) {
       throw aggregateErrorWithCause(
-        [restartError, cleanupError],
+        [
+          { role: "primary", error: restartError },
+          { role: "cleanup", error: cleanupError },
+        ],
         "Gateway restart failed and the one-shot startup trace environment could not be cleared",
         cleanupError,
       );
@@ -1770,6 +2595,41 @@ function bootstrapManagedGateway(runCommand, checkout, deployment, options = {})
     throwPreservingValue(restartError);
   }
   return { processStartedAt };
+}
+
+async function bootstrapLaunchAgentAndWait(
+  runCommand,
+  checkout,
+  deployment,
+  domain,
+  waitForProcess,
+  sleep,
+) {
+  try {
+    await runUpdateCommand(
+      runCommand,
+      "launchd.bootstrap",
+      "/bin/launchctl",
+      ["bootstrap", domain, deployment.plistPath],
+      checkout,
+      {
+        phase: "Gateway LaunchAgent bootstrap",
+        serviceState: "stopped",
+        timeoutMs: COMMAND_TIMEOUT_MS.gatewayService,
+      },
+    );
+  } catch (bootstrapError) {
+    if (findUnsafeCommandCleanupFailure(bootstrapError)) {
+      throwPreservingValue(bootstrapError);
+    }
+    try {
+      await waitForProcess(deployment, sleep);
+      return;
+    } catch {
+      throwPreservingValue(bootstrapError);
+    }
+  }
+  await waitForProcess(deployment, sleep);
 }
 
 function armLaunchdEnvironmentRestore(name, previousValue) {
@@ -1820,7 +2680,11 @@ fi
 }
 
 function readLaunchdEnvironmentVariable(name) {
-  const result = spawnSync("/bin/launchctl", ["getenv", name], { encoding: "utf8" });
+  const result = spawnSync(
+    "/bin/launchctl",
+    ["getenv", name],
+    boundedSyncOptions({ encoding: "utf8" }),
+  );
   if (result.error || result.status !== 0) {
     throw new UpdateInvariantError(
       "gateway_restart_failed",
@@ -1833,17 +2697,21 @@ function readLaunchdEnvironmentVariable(name) {
   return value || null;
 }
 
-function waitForManagedGatewayProcess(deployment, sleep = defaultSleep) {
+async function waitForManagedGatewayProcess(deployment, sleep = defaultSleep) {
   const target = `gui/${process.getuid()}/${deployment.label}`;
   const attempts =
     Math.ceil(GATEWAY_PROCESS_START_TIMEOUT_MS / GATEWAY_PROCESS_START_RETRY_DELAY_MS) + 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const result = spawnSync("/bin/launchctl", ["print", target], { encoding: "utf8" });
+    const result = spawnSync(
+      "/bin/launchctl",
+      ["print", target],
+      boundedSyncOptions({ encoding: "utf8" }),
+    );
     if (result.status === 0 && /\bpid\s*=\s*\d+\b/iu.test(result.stdout)) {
       return;
     }
     if (attempt + 1 < attempts) {
-      sleep(GATEWAY_PROCESS_START_RETRY_DELAY_MS);
+      await sleep(GATEWAY_PROCESS_START_RETRY_DELAY_MS);
     }
   }
   throw new UpdateInvariantError(
@@ -1856,22 +2724,22 @@ function isManagedGatewayLoaded(deployment) {
   const result = spawnSync(
     "/bin/launchctl",
     ["print", `gui/${process.getuid()}/${deployment.label}`],
-    { encoding: "utf8" },
+    boundedSyncOptions({ encoding: "utf8" }),
   );
   return result.status === 0;
 }
 
-function waitForManagedGatewayReadiness(
+async function waitForManagedGatewayReadiness(
   deployment,
   probeMilestones = probeGatewayMilestones,
   sleep = defaultSleep,
 ) {
   for (let attempt = 1; attempt <= GATEWAY_READINESS_ATTEMPTS; attempt += 1) {
-    if (probeMilestones(deployment)?.readyzReady) {
+    if ((await Promise.resolve(probeMilestones(deployment)))?.readyzReady) {
       return;
     }
     if (attempt < GATEWAY_READINESS_ATTEMPTS) {
-      sleep(GATEWAY_READINESS_RETRY_DELAY_MS);
+      await sleep(GATEWAY_READINESS_RETRY_DELAY_MS);
     }
   }
   throw new UpdateInvariantError(
@@ -1880,7 +2748,7 @@ function waitForManagedGatewayReadiness(
   );
 }
 
-export function isGatewayProbeResponse(route, payload) {
+function isGatewayProbeResponse(route, payload) {
   return route === "/readyz"
     ? payload?.ready === true
     : payload?.ok === true && payload.status === "live";
@@ -1899,7 +2767,7 @@ function probeGatewayHttp(port, route) {
         "1",
         `${scheme}://127.0.0.1:${port}${route}`,
       ],
-      { encoding: "utf8" },
+      boundedSyncOptions({ encoding: "utf8" }, 5_000),
     );
     if (result.status !== 0) {
       continue;
@@ -1920,7 +2788,7 @@ function probeGatewayMilestones(deployment) {
   const listeners = spawnSync(
     "/usr/sbin/lsof",
     ["-nP", `-iTCP:${deployment.port}`, "-sTCP:LISTEN", "-t"],
-    { encoding: "utf8" },
+    boundedSyncOptions({ encoding: "utf8" }),
   );
   const listenerReady = listeners.status === 0 && Boolean(listeners.stdout.trim());
   if (!listenerReady) {
@@ -1958,28 +2826,22 @@ function markGatewayMilestones(timing, observation, observedAt, deepRpcUpperBoun
   if (!observation) {
     return;
   }
-  if (observation.listenerReady) {
-    recordGatewayTimestamp(
-      timing,
-      "listenerReadyAt",
-      deepRpcUpperBoundAt ?? observedAt,
-      deepRpcUpperBoundAt ? "no-later-than" : "observed",
-    );
-  }
-  if (observation.healthzReady) {
-    recordGatewayTimestamp(
-      timing,
-      "healthzReadyAt",
-      deepRpcUpperBoundAt ?? observedAt,
-      deepRpcUpperBoundAt ? "no-later-than" : "observed",
-    );
+  for (const key of ["listenerReady", "healthzReady"]) {
+    if (observation[key]) {
+      recordGatewayTimestamp(
+        timing,
+        `${key}At`,
+        deepRpcUpperBoundAt ?? observedAt,
+        deepRpcUpperBoundAt ? "no-later-than" : "observed",
+      );
+    }
   }
   if (observation.readyzReady) {
     recordGatewayTimestamp(timing, "readyzReadyAt", observedAt);
   }
 }
 
-function verifyGatewayDeepRpc(runCommand, checkout, expectedSha, deployment, now) {
+async function verifyGatewayDeepRpc(runCommand, checkout, expectedSha, deployment, now) {
   assertExactBuild(checkout, expectedSha);
   if (deployment) {
     runBuiltGatewayCli(
@@ -1988,50 +2850,85 @@ function verifyGatewayDeepRpc(runCommand, checkout, expectedSha, deployment, now
       deployment,
     );
   } else {
-    runCommand(
+    await runUpdateCommand(
+      runCommand,
+      "gateway.status",
       "pnpm",
       ["openclaw", "gateway", "status", "--deep", "--require-rpc", "--json"],
       checkout,
+      {
+        phase: "Gateway deep status probe",
+        serviceState: "running",
+        timeoutMs: COMMAND_TIMEOUT_MS.gatewayProbe,
+      },
     );
   }
   return timestampAt(now);
 }
 
-function readGatewayHealth(runCommand, checkout, deployment) {
+async function readGatewayHealth(runCommand, checkout, deployment) {
   if (deployment) {
     const healthOutput = runBuiltGatewayCli(
       checkout,
       ["health", "--verbose", "--json"],
       deployment,
     );
-    let healthSummary;
     try {
-      healthSummary = JSON.parse(healthOutput);
+      return JSON.parse(healthOutput);
     } catch (error) {
       throw new UpdateInvariantError(
         "gateway_health_invalid",
         `Gateway health probe did not return JSON: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    return healthSummary;
   }
-  runCommand("pnpm", ["openclaw", "health", "--verbose", "--json"], checkout);
+  await runUpdateCommand(
+    runCommand,
+    "gateway.health",
+    "pnpm",
+    ["openclaw", "health", "--verbose", "--json"],
+    checkout,
+    {
+      phase: "Gateway health probe",
+      serviceState: "running",
+      timeoutMs: COMMAND_TIMEOUT_MS.gatewayProbe,
+    },
+  );
   return null;
 }
 
-function verifyGateway(runCommand, checkout, expectedSha, deployment = null, now = Date.now) {
-  const deepRpcReadyAt = verifyGatewayDeepRpc(runCommand, checkout, expectedSha, deployment, now);
+async function verifyGateway(runCommand, checkout, expectedSha, deployment = null, now = Date.now) {
+  const deepRpcReadyAt = await verifyGatewayDeepRpc(
+    runCommand,
+    checkout,
+    expectedSha,
+    deployment,
+    now,
+  );
   return {
     deepRpcReadyAt,
-    healthSummary: readGatewayHealth(runCommand, checkout, deployment),
+    healthSummary: await readGatewayHealth(runCommand, checkout, deployment),
   };
 }
 
-function defaultSleep(ms) {
-  execFileSync("sleep", [String(ms / 1_000)]);
-}
-
-export function verifyGatewayReadiness(
+/**
+ * @param {(command: string, args: string[], checkout: string, options?: Record<string, unknown>) => void | Promise<void>} runCommand
+ * @param {string} checkout
+ * @param {string} expectedSha
+ * @param {(ms: number) => void | Promise<void>} [sleep]
+ * @param {GatewayCliDeployment | null} [deployment]
+ * @param {{
+ *   now?: () => number,
+ *   probeMilestones?: (deployment: GatewayCliDeployment) => {
+ *     listenerReady: boolean,
+ *     healthzReady: boolean,
+ *     readyzReady: boolean,
+ *   },
+ *   timing?: Record<string, unknown>,
+ * }} [options]
+ * @returns {Promise<Record<string, unknown>>}
+ */
+export async function verifyGatewayReadiness(
   runCommand,
   checkout,
   expectedSha,
@@ -2056,7 +2953,7 @@ export function verifyGatewayReadiness(
       if (deployment) {
         markGatewayMilestones(timing, probeMilestones(deployment), timestampAt(now));
       }
-      const deepRpcReadyAt = verifyGatewayDeepRpc(
+      const deepRpcReadyAt = await verifyGatewayDeepRpc(
         runCommand,
         checkout,
         expectedSha,
@@ -2072,7 +2969,7 @@ export function verifyGatewayReadiness(
           deepRpcReadyAt,
         );
       }
-      const healthSummary = readGatewayHealth(runCommand, checkout, deployment);
+      const healthSummary = await readGatewayHealth(runCommand, checkout, deployment);
       if (channelConnected(healthSummary, "discord")) {
         recordGatewayTimestamp(timing, "discordConnectedAt", timestampAt(now));
       }
@@ -2083,7 +2980,7 @@ export function verifyGatewayReadiness(
     } catch (error) {
       lastError = error;
       if (attempt < GATEWAY_READINESS_ATTEMPTS) {
-        sleep(GATEWAY_READINESS_RETRY_DELAY_MS);
+        await sleep(GATEWAY_READINESS_RETRY_DELAY_MS);
       }
     }
   }
@@ -2227,6 +3124,12 @@ function summarizeGatewayLogAudit(entries) {
   };
 }
 
+/**
+ * @param {string} output
+ * @param {number} sinceMs
+ * @param {string | null} [sourceRoot]
+ * @param {string[] | null} [managedSourceRoots]
+ */
 export function parseGatewayLogAudit(output, sinceMs, sourceRoot = null, managedSourceRoots = []) {
   const entries = parseGatewayLogEntries(output, sinceMs).filter((entry) =>
     isCurrentGatewayLogSource(entry.source, sourceRoot, managedSourceRoots),
@@ -2276,7 +3179,7 @@ function readManagedPluginSourceRoots(checkout, deployment) {
   }
 }
 
-export function resolveManagedPluginSourceRoots(report) {
+function resolveManagedPluginSourceRoots(report) {
   if (!Array.isArray(report?.plugins)) {
     return null;
   }
@@ -2290,7 +3193,11 @@ export function resolveManagedPluginSourceRoots(report) {
   return roots;
 }
 
-export function resolveManagedGatewaySourceRoot(checkout, deployment) {
+/**
+ * @param {string} checkout
+ * @param {GatewayDeploymentRef | null | undefined} deployment
+ */
+function resolveManagedGatewaySourceRoot(checkout, deployment) {
   return typeof deployment?.entrypoint === "string" && deployment.entrypoint.length > 0
     ? path.dirname(path.resolve(deployment.entrypoint))
     : path.join(realpathSync(checkout), "dist");
@@ -2312,7 +3219,11 @@ function defaultAuditGatewayLogs(checkout, sinceMs, deployment = null) {
         "--timeout",
         "10000",
       ],
-      { cwd: checkout, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+      boundedSyncOptions({
+        cwd: checkout,
+        encoding: "utf8",
+        maxBuffer: 4 * 1024 * 1024,
+      }),
     );
   } catch (error) {
     output = readFallbackGatewayLogs(sinceMs);
@@ -2335,7 +3246,7 @@ function defaultAuditGatewayLogs(checkout, sinceMs, deployment = null) {
   return audit;
 }
 
-function verifyAndAuditGateway({
+async function verifyAndAuditGateway({
   runCommand,
   auditGatewayLogs,
   checkout,
@@ -2350,15 +3261,22 @@ function verifyAndAuditGateway({
   let verificationError;
   let gatewayTiming = timing;
   try {
-    gatewayTiming = verifyGatewayReadiness(runCommand, checkout, expectedSha, sleep, deployment, {
-      timing,
-      now,
-      probeMilestones,
-    });
+    gatewayTiming = await verifyGatewayReadiness(
+      runCommand,
+      checkout,
+      expectedSha,
+      sleep,
+      deployment,
+      {
+        timing,
+        now,
+        probeMilestones,
+      },
+    );
   } catch (error) {
     verificationError = error;
   }
-  const audit = auditGatewayLogs(checkout, sinceMs, deployment);
+  const audit = await auditGatewayLogs(checkout, sinceMs, deployment);
   if (verificationError) {
     throwPreservingValue(verificationError);
   }
@@ -2391,7 +3309,7 @@ function finalizeGatewayTiming(timing) {
   };
 }
 
-export function findExactMacTarget(processes, executable) {
+function findExactMacTarget(processes, executable) {
   const target = processes
     .split("\n")
     .map((line) => line.trim().match(/^(\d+)\s+(.+)$/u))
@@ -2399,12 +3317,14 @@ export function findExactMacTarget(processes, executable) {
   return target ? { executable, pid: Number(target[1]) } : null;
 }
 
-function defaultVerifyMacTarget(checkout) {
-  execFileSync("sleep", ["10"]);
+async function defaultVerifyMacTarget(checkout) {
+  await defaultSleep(10_000);
   const executable = path.join(checkout, "dist/OpenClaw.app/Contents/MacOS/OpenClaw");
-  const processes = execFileSync("ps", ["axww", "-o", "pid=,command="], {
-    encoding: "utf8",
-  });
+  const processes = execFileSync(
+    "ps",
+    ["axww", "-o", "pid=,command="],
+    boundedSyncOptions({ encoding: "utf8" }),
+  );
   const target = findExactMacTarget(processes, executable);
   if (!target) {
     throw new UpdateInvariantError(
@@ -2415,7 +3335,13 @@ function defaultVerifyMacTarget(checkout) {
   return target;
 }
 
-export function maintainMain(options, dependencies = {}) {
+/**
+ * @overload
+ * @param {Record<string, unknown>} options
+ * @param {Record<string, unknown>} [dependencies]
+ * @returns {Promise<UpdateResult>}
+ */
+export async function maintainMain(options, dependencies = {}) {
   const lock = acquireMaintenanceLock(options.checkout, options.lockPath);
   if (!lock.acquired) {
     return {
@@ -2423,14 +3349,32 @@ export function maintainMain(options, dependencies = {}) {
       ok: true,
       skipped: true,
       reason: "overlap",
-      lock: { path: lock.lockPath, ownerPid: lock.owner.pid, startedAt: lock.owner.startedAt },
+      lock: {
+        path: lock.lockPath,
+        ownerPid: lock.owner.pid,
+        startedAt: lock.owner.startedAt,
+        ...(Number.isInteger(lock.owner.processGroupId)
+          ? { processGroupId: lock.owner.processGroupId }
+          : {}),
+        ...(lock.owner.manualRecoveryRequired === true ? { manualRecoveryRequired: true } : {}),
+        ...(typeof lock.owner.processTreeState === "string"
+          ? { processTreeState: lock.owner.processTreeState }
+          : {}),
+        ...(typeof lock.owner.reason === "string" ? { reason: lock.owner.reason } : {}),
+      },
     };
   }
 
   let preparedGatewayReplacement = null;
+  let retainMaintenanceLock = false;
   try {
     const verifiedBefore = verifyCheckout(options.checkout, { remote: options.remote });
-    const runCommand = dependencies.runCommand ?? defaultRunCommand;
+    const managedCommand = (command, args, checkout, commandOptions = {}) =>
+      defaultRunCommand(command, args, checkout, {
+        ...commandOptions,
+        runManagedCommand: dependencies.runManagedCommand,
+      });
+    const runCommand = dependencies.runCommand ?? managedCommand;
     const inspectGatewayDeployment =
       dependencies.inspectGatewayDeployment ?? inspectManagedGatewayDeployment;
     const repointGatewayDeployment =
@@ -2472,7 +3416,7 @@ export function maintainMain(options, dependencies = {}) {
       dependencies.readLaunchdEnvironment ?? readLaunchdEnvironmentVariable;
     const armEnvironmentRestore =
       dependencies.armEnvironmentRestore ?? armLaunchdEnvironmentRestore;
-    const gatewayDeploymentBefore = inspectGatewayDeployment(verifiedBefore.checkout);
+    const gatewayDeploymentBefore = await inspectGatewayDeployment(verifiedBefore.checkout);
     const sourceBuildBeforeUpdate = inspectBuildState(
       verifiedBefore.checkout,
       verifiedBefore.headSha,
@@ -2483,7 +3427,7 @@ export function maintainMain(options, dependencies = {}) {
       sourceBuildBeforeUpdate,
       verifiedBefore.headSha,
     );
-    const update = updateMain(options, dependencies);
+    const update = await updateMain(options, managedCommand, dependencies);
     const statePath = options.statePath ?? defaultStatePath(update.checkout);
     const maintenanceState = readMaintenanceState(statePath);
     const buildBefore = inspectBuildState(update.checkout, update.afterSha);
@@ -2539,7 +3483,7 @@ export function maintainMain(options, dependencies = {}) {
         try {
           gatewaySuspension = {
             status: "offline",
-            proof: proveGatewayStopped(update.checkout),
+            proof: await proveGatewayStopped(update.checkout),
           };
         } catch (proofError) {
           try {
@@ -2553,7 +3497,18 @@ export function maintainMain(options, dependencies = {}) {
             // clean source build cannot mutate its code. Build only to obtain
             // an exact trusted client for the suspension RPC.
             if (actions.dependencyInstall) {
-              runCommand("pnpm", ["install", "--frozen-lockfile"], update.checkout);
+              await runUpdateCommand(
+                runCommand,
+                "dependencies.install",
+                "pnpm",
+                ["install", "--frozen-lockfile"],
+                update.checkout,
+                {
+                  phase: "dependency install",
+                  serviceState: "running",
+                  timeoutMs: COMMAND_TIMEOUT_MS.dependencyInstall,
+                },
+              );
               controlDependenciesInstalled = true;
             }
             if (!actions.gatewayBuild) {
@@ -2562,7 +3517,7 @@ export function maintainMain(options, dependencies = {}) {
                 "managed Gateway snapshot has no exact trusted source control build",
               );
             }
-            runBuildWithPreservedMacApp(runCommand, update.checkout, sleep);
+            await runBuildWithPreservedMacApp(runCommand, update.checkout, sleep, "running");
             assertExactBuild(update.checkout, update.afterSha);
             controlBuildPrepared = true;
             gatewayControlDeployment = resolveGatewayControlDeployment(
@@ -2577,16 +3532,19 @@ export function maintainMain(options, dependencies = {}) {
                 "source build did not produce an exact trusted Gateway control client",
               );
             }
-            gatewaySuspension = prepareSuspension(update.checkout, gatewayControlDeployment);
+            gatewaySuspension = await prepareSuspension(update.checkout, gatewayControlDeployment);
           } catch (controlError) {
             throw aggregateErrorWithCause(
               [
-                new UpdateInvariantError(
-                  "gateway_snapshot_control_unavailable",
-                  "managed Gateway uses a snapshot but the source checkout has no exact trusted control build",
-                ),
-                proofError,
-                controlError,
+                {
+                  role: "context",
+                  error: new UpdateInvariantError(
+                    "gateway_snapshot_control_unavailable",
+                    "managed Gateway uses a snapshot but the source checkout has no exact trusted control build",
+                  ),
+                },
+                { role: "proof", error: proofError },
+                { role: "primary", error: controlError },
               ],
               "Gateway control is unavailable and the managed Gateway could not be proven stopped",
               controlError,
@@ -2595,21 +3553,70 @@ export function maintainMain(options, dependencies = {}) {
         }
       } else {
         try {
-          gatewaySuspension = prepareSuspension(update.checkout, gatewayControlDeployment);
+          gatewaySuspension = await prepareSuspension(update.checkout, gatewayControlDeployment);
         } catch (prepareError) {
           try {
             gatewaySuspension = {
               status: "offline",
-              proof: proveGatewayStopped(update.checkout),
+              proof: await proveGatewayStopped(update.checkout),
             };
           } catch (proofError) {
             throw aggregateErrorWithCause(
-              [prepareError, proofError],
+              [
+                { role: "primary", error: prepareError },
+                { role: "proof", error: proofError },
+              ],
               "Gateway suspension failed and the managed Gateway could not be proven stopped",
               proofError,
             );
           }
         }
+      }
+      if (
+        gatewaySuspension.status === "busy" &&
+        gatewaySuspension.controlledDrainSupported !== false &&
+        gatewayControlDeployment
+      ) {
+        const stopped = await drainManagedGatewayForMaintenance(
+          update.checkout,
+          gatewayDeploymentBefore,
+          gatewayControlDeployment,
+          async (commitStop) => {
+            if (gatewayDeploymentBefore) {
+              await assertSystemOwnership(gatewayDeploymentBefore.label);
+            }
+            if (gatewayRuntimeRepointRequired) {
+              preparedGatewayReplacement = prepareGatewayEntrypointReplacement(
+                gatewayDeploymentBefore,
+                path.join(update.checkout, "dist/index.js"),
+              );
+            }
+            await commitStop();
+            return stopManagedGatewayAndProve(
+              runCommand,
+              update.checkout,
+              gatewayDeploymentBefore,
+              proveGatewayStopped,
+              sleep,
+              now,
+            );
+          },
+          () => {
+            const owner = JSON.parse(readFileSync(path.join(lock.lockPath, "owner.json"), "utf8"));
+            if (
+              owner.pid !== process.pid ||
+              owner.startedAt !== lock.owner.startedAt ||
+              gitText(update.checkout, ["rev-parse", "HEAD"]) !== update.afterSha
+            ) {
+              throw new UpdateInvariantError(
+                "lock_owner_changed",
+                "Maintenance authority changed during Gateway drain",
+              );
+            }
+          },
+        );
+        gatewayTiming = stopped.timing;
+        gatewaySuspension = { status: "offline", proof: stopped.proof };
       }
       if (gatewaySuspension.status === "busy") {
         return {
@@ -2630,7 +3637,7 @@ export function maintainMain(options, dependencies = {}) {
         // and avoids source launchers that can rebuild stale dist before stopping.
         try {
           if (gatewayDeploymentBefore) {
-            assertSystemOwnership(gatewayDeploymentBefore.label);
+            await assertSystemOwnership(gatewayDeploymentBefore.label);
           }
           if (gatewayRuntimeRepointRequired) {
             // Complete every fallible plist rewrite and validation while the
@@ -2642,7 +3649,7 @@ export function maintainMain(options, dependencies = {}) {
           }
           // launchctl can return before the job and listener have disappeared.
           // Retarget only after bounded native proof prevents cached snapshot revival.
-          const stopped = stopManagedGatewayAndProve(
+          const stopped = await stopManagedGatewayAndProve(
             runCommand,
             update.checkout,
             gatewayDeploymentBefore,
@@ -2654,14 +3661,17 @@ export function maintainMain(options, dependencies = {}) {
           gatewayStoppedForMaintenance = true;
         } catch (error) {
           try {
-            resumeSuspension(
+            await resumeSuspension(
               update.checkout,
               gatewaySuspension.suspensionId,
               gatewayControlDeployment,
             );
           } catch (resumeError) {
             throw aggregateErrorWithCause(
-              [error, resumeError],
+              [
+                { role: "primary", error },
+                { role: "rollback", error: resumeError },
+              ],
               "Gateway stop failed and the prepared maintenance suspension could not be resumed",
               resumeError,
             );
@@ -2671,15 +3681,26 @@ export function maintainMain(options, dependencies = {}) {
       }
       try {
         if (actions.dependencyInstall && !controlDependenciesInstalled) {
-          runCommand("pnpm", ["install", "--frozen-lockfile"], update.checkout);
+          await runUpdateCommand(
+            runCommand,
+            "dependencies.install",
+            "pnpm",
+            ["install", "--frozen-lockfile"],
+            update.checkout,
+            {
+              phase: "dependency install",
+              serviceState: "stopped",
+              timeoutMs: COMMAND_TIMEOUT_MS.dependencyInstall,
+            },
+          );
         }
         if (actions.gatewayBuild && !controlBuildPrepared) {
-          runBuildWithPreservedMacApp(runCommand, update.checkout, sleep);
+          await runBuildWithPreservedMacApp(runCommand, update.checkout, sleep);
         }
         assertExactBuild(update.checkout, update.afterSha);
         const restartStartedAt = now();
         if (gatewayDeploymentBefore) {
-          assertSystemOwnership(gatewayDeploymentBefore.label);
+          await assertSystemOwnership(gatewayDeploymentBefore.label);
         }
         gatewayDeployment = gatewayDeploymentBefore
           ? repointGatewayDeployment(
@@ -2708,7 +3729,7 @@ export function maintainMain(options, dependencies = {}) {
           telegramConnectedAt: null,
           ...gatewayTiming,
         };
-        const restart = restartManagedGateway(
+        const restart = await restartManagedGateway(
           runCommand,
           update.checkout,
           update.afterSha,
@@ -2727,7 +3748,7 @@ export function maintainMain(options, dependencies = {}) {
         if (typeof restart?.processStartedAt === "string") {
           recordGatewayTimestamp(gatewayTiming, "processStartedAt", restart.processStartedAt);
         }
-        const verification = verifyGatewayAfterRestart({
+        const verification = await verifyGatewayAfterRestart({
           runCommand,
           auditGatewayLogs,
           checkout: update.checkout,
@@ -2741,8 +3762,11 @@ export function maintainMain(options, dependencies = {}) {
         });
         gatewayLogAudit = verification?.audit ?? verification;
         gatewayTiming = finalizeGatewayTiming(verification?.timing ?? gatewayTiming);
-        gatewayRuntime = verifyGatewayRuntime(update.checkout, update.afterSha);
+        gatewayRuntime = await verifyGatewayRuntime(update.checkout, update.afterSha);
       } catch (error) {
+        if (findUnsafeCommandCleanupFailure(error)) {
+          throwPreservingValue(error);
+        }
         if (!gatewayStoppedForMaintenance || !gatewayDeploymentBefore) {
           throw error;
         }
@@ -2750,7 +3774,7 @@ export function maintainMain(options, dependencies = {}) {
           // A failed bootstrap may still have registered or started the
           // replacement. Bootout is allowed to fail only when native proof
           // independently confirms that no job or listener remains.
-          stopManagedGatewayAndProve(
+          await stopManagedGatewayAndProve(
             runCommand,
             update.checkout,
             gatewayDeploymentBefore,
@@ -2759,16 +3783,19 @@ export function maintainMain(options, dependencies = {}) {
             now,
           );
           preparedGatewayReplacement?.restore?.();
-          bootstrapManagedGateway(runCommand, update.checkout, gatewayDeploymentBefore, {
+          await bootstrapManagedGateway(runCommand, update.checkout, gatewayDeploymentBefore, {
             now,
             sleep,
             waitForProcess: waitForGatewayProcess,
             assertNoSystemLaunchDaemonOwnership: assertSystemOwnership,
           });
-          waitForManagedGatewayReadiness(gatewayDeploymentBefore, probeMilestones, sleep);
+          await waitForManagedGatewayReadiness(gatewayDeploymentBefore, probeMilestones, sleep);
         } catch (recoveryError) {
           throw aggregateErrorWithCause(
-            [error, recoveryError],
+            [
+              { role: "primary", error },
+              { role: "rollback", error: recoveryError },
+            ],
             "Gateway replacement failed and the previous managed service could not be restored",
             recoveryError,
           );
@@ -2777,15 +3804,20 @@ export function maintainMain(options, dependencies = {}) {
       }
     } else {
       try {
-        verifyGatewayProbe(runCommand, update.checkout, update.afterSha, gatewayControlDeployment);
-        gatewayRuntime = verifyGatewayRuntime(update.checkout, update.afterSha);
+        await verifyGatewayProbe(
+          runCommand,
+          update.checkout,
+          update.afterSha,
+          gatewayControlDeployment,
+        );
+        gatewayRuntime = await verifyGatewayRuntime(update.checkout, update.afterSha);
       } catch {
         actions.gatewayRestart = true;
         actions.gatewaySelfHeal = true;
         const bootstrap =
-          gatewayControlDeployment !== null && !isGatewayLoaded(gatewayControlDeployment);
+          gatewayControlDeployment !== null && !(await isGatewayLoaded(gatewayControlDeployment));
         const restartStartedAt = now();
-        const restart = restartManagedGateway(
+        const restart = await restartManagedGateway(
           runCommand,
           update.checkout,
           update.afterSha,
@@ -2817,7 +3849,7 @@ export function maintainMain(options, dependencies = {}) {
         if (typeof restart?.processStartedAt === "string") {
           recordGatewayTimestamp(gatewayTiming, "processStartedAt", restart.processStartedAt);
         }
-        const verification = verifyGatewayAfterRestart({
+        const verification = await verifyGatewayAfterRestart({
           runCommand,
           auditGatewayLogs,
           checkout: update.checkout,
@@ -2831,7 +3863,7 @@ export function maintainMain(options, dependencies = {}) {
         });
         gatewayLogAudit = verification?.audit ?? verification;
         gatewayTiming = finalizeGatewayTiming(verification?.timing ?? gatewayTiming);
-        gatewayRuntime = verifyGatewayRuntime(update.checkout, update.afterSha);
+        gatewayRuntime = await verifyGatewayRuntime(update.checkout, update.afterSha);
       }
     }
     if (actions.macAppRebuild) {
@@ -2845,11 +3877,13 @@ export function maintainMain(options, dependencies = {}) {
         // The exact-SHA JS build above already produced dist/control-ui. Letting
         // Mac packaging rebuild it can empty dist while the live app bundle is
         // there, defeating the staged-swap guarantee.
-        runCommand(
+        await runUpdateCommand(
+          runCommand,
+          "mac.restart",
           "env",
           [
-            "SKIP_TSC=1",
-            "SKIP_UI_BUILD=1",
+            "OPENCLAW_MAC_REUSE_BUILD=1",
+            "SKIP_PNPM_INSTALL=1",
             "bash",
             "scripts/restart-mac.sh",
             "--sign",
@@ -2857,9 +3891,14 @@ export function maintainMain(options, dependencies = {}) {
             "--target-only",
           ],
           update.checkout,
+          {
+            phase: "Mac app rebuild",
+            serviceState: "running",
+            timeoutMs: COMMAND_TIMEOUT_MS.macAppRebuild,
+          },
         );
-        const macTarget = verifyMacTarget(update.checkout);
-        verifyGatewayProbe(
+        const macTarget = await verifyMacTarget(update.checkout);
+        await verifyGatewayProbe(
           runCommand,
           update.checkout,
           update.afterSha,
@@ -2901,14 +3940,28 @@ export function maintainMain(options, dependencies = {}) {
       ...(gatewayRuntime ? { gatewayRuntime } : {}),
       ...(maintenanceState.macTarget ? { macTarget: maintenanceState.macTarget } : {}),
     };
+  } catch (error) {
+    const cleanupFailure = findUnsafeCommandCleanupFailure(error);
+    if (cleanupFailure) {
+      retainMaintenanceLock = true;
+      lock.retainForCleanupFailure(cleanupFailure.details);
+      cleanupFailure.details = {
+        ...cleanupFailure.details,
+        lockPath: lock.lockPath,
+        lockRetained: true,
+      };
+    }
+    return throwPreservingValue(error);
   } finally {
     preparedGatewayReplacement?.discard();
-    lock.release();
+    if (!retainMaintenanceLock) {
+      lock.release();
+    }
   }
 }
 
 function parseArgs(argv) {
-  const options = { checkout: DEFAULT_CHECKOUT, remote: "origin" };
+  const options = { checkout: process.cwd(), remote: "origin" };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--checkout") {
@@ -2928,17 +3981,15 @@ function parseArgs(argv) {
   return options;
 }
 
-function main(argv = process.argv.slice(2)) {
+export async function runLiveUpdaterMain(argv = process.argv.slice(2), dependencies = {}) {
   try {
-    console.log(JSON.stringify(maintainMain(parseArgs(argv))));
+    console.log(JSON.stringify(await maintainMain(parseArgs(argv), dependencies)));
   } catch (error) {
-    const code = error instanceof UpdateInvariantError ? error.code : "update_failed";
-    const message = error instanceof Error ? error.message : String(error);
-    console.log(JSON.stringify({ schemaVersion: 1, ok: false, error: { code, message } }));
+    console.log(JSON.stringify(formatUpdateFailure(error)));
     process.exitCode = 1;
   }
 }
 
 if (isDirectRunUrl(process.argv[1], import.meta.url)) {
-  main();
+  void runLiveUpdaterMain();
 }

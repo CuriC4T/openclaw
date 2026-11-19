@@ -1,6 +1,6 @@
 // Generated file. Do not edit directly.
 // Source: src/infra/host-env-security-policy.json
-// Regenerate: node scripts/generate-host-env-security-policy-swift.mjs --write
+// Regenerate: node --import tsx scripts/generate-host-env-security-policy-swift.mts --write
 
 import Foundation
 
@@ -162,6 +162,8 @@ enum HostEnvSecurityPolicy {
         "PERL5DBCMD",
         "PERL5LIB",
         "PERL5OPT",
+        "PERL5SHELL",
+        "PERLLIB",
         "PHPRC",
         "PHP_INI_SCAN_DIR",
         "PIP_CONFIG_FILE",
@@ -308,6 +310,8 @@ enum HostEnvSecurityPolicy {
         "PACKER_PLUGIN_PATH",
         "PERL5LIB",
         "PERL5OPT",
+        "PERL5SHELL",
+        "PERLLIB",
         "PS4",
         "PYTHONBREAKPOINT",
         "PYTHONHOME",
